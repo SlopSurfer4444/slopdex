@@ -15,7 +15,9 @@ private receipt remains authority for the complete local build record.
 - Canonical set: 37 tracked diff paths + 20 new files; sorted UTF-8
   LF-terminated `T<TAB>path<TAB>lowercase_sha256` /
   `U<TAB>path<TAB>lowercase_sha256` records.
-- Unrelated dirty tail: 187 tracked paths preserved and excluded.
+- Original source index and unrelated work were preserved. A previously
+  included unrelated-path count was not independently established and is not
+  used as publication evidence; the accepted source set is the 57-path manifest.
 
 ## Build
 
@@ -48,7 +50,7 @@ The immutable private build-receipt SHA-256 is
 - Cargo/rustc processes after build: none observed.
 - CLI bounded non-network smoke: `--version` -> `codex-cli 0.0.0`, exit 0.
 - Code Mode helper bounded `--help`: exit 0.
-- All four public copies re-hashed and matched the immutable artifact
+- All four locally held copies re-hashed and matched the immutable artifact
   generation byte-for-byte.
 - Installed Desktop binding to the exact CLI hash was independently verified.
 - The complete patch proof is recorded in `../source/PATCH_RECEIPT.md`.

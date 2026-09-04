@@ -3,6 +3,11 @@
 This is an experimental preview, not an official, stable, upstream-accepted,
 or generally production-ready release.
 
+See the [reconciled findings index](findings/README.md) for exact status and
+evidence boundaries. It separates source-patched behavior from still-open
+reported REDs, unconfirmed historical leads and unimplemented capabilities;
+not every entry has a publishable reproducer yet.
+
 - One installed-Desktop nested retained-successor sample passed. It does not
   establish global exactly-once delivery, all successor sequences,
   restart/crash durability, durable acknowledgement/replay, exactly-once model

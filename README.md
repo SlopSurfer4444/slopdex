@@ -17,6 +17,8 @@ not an official OpenAI release or an OpenAI-endorsed project.
 
 ## Start here
 
+- [Review the exact code diff and regression tests](slopdex/REVIEW_GUIDE.md)
+- [Findings: patched, open RED, unconfirmed and deferred](slopdex/findings/README.md)
 - [What we learned: from Sol to the Astra chapter](slopdex/SHORTGRID.en.md)
 - [What changed](slopdex/RELEASE_NOTES.md)
 - [Known limitations and findings not claimed as fixed](slopdex/KNOWN_LIMITATIONS.md)
@@ -84,18 +86,19 @@ launch ready independent branches, choose models with enough capability,
 and aggregate through the nearest responsible agent. They do not require a
 fixed number of agents or a permanent coordinator for every task.
 
-Review [the policy bundle](slopdex/policy/) before installing it. It is the
-configuration we arrived at through field work, offered as a starting point.
-You can use the code without it.
+The [policy bundle](slopdex/policy/) preserves the historical Sol configuration.
+You can use the code without it; review the files before adopting them.
 
-With the skills installed, open your project and say:
+**Post-drop decision, 2026-09-05:** in the first Astra field campaigns we chose
+to retire the separate role-initialization layer from the active recipe. Give
+the project an ordinary task; a separate coordinator is useful when the work
+justifies one, not because the user remembered a title or skill name. Scope,
+ownership, verification and real approval boundaries still apply. See
+[the policy-evolution note](slopdex/policy/EVOLUTION.md); the original Sol
+snapshot and narrative are retained, and global rollout is a separate action.
 
-> You are the parent architect for this project. Read and follow
-> `$control-role-boundary`. Take the campaign to an honest result.
-
-The parent creates an operational coordinator when the work benefits from
-one. Independent writers are useful only when their write surfaces and
-dependencies really are separate.
+Independent writers are useful only when their write surfaces and dependencies
+really are separate.
 
 ## Built with Sol. Next: Astra.
 
