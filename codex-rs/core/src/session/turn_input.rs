@@ -18,6 +18,9 @@ use super::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
+use crate::tasks::SessionTask;
+use crate::tasks::TasklessTurnClaimStatus;
+use crate::tasks::UserTurnStartClaim;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -70,6 +73,36 @@ impl TurnStartKind {
     ) -> bool {
         self.permits_mode(current.step_settings.collaboration_mode.mode)
             && self.permits_mode(proposed.step_settings.collaboration_mode.mode)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct UserStartClaimBarrier {
+    claimed: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl UserStartClaimBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            claimed: Arc::new(tokio::sync::Notify::new()),
+            proceed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_until_claimed(&self) {
+        self.claimed.notified().await;
+    }
+
+    async fn pause_after_claim(&self) {
+        self.claimed.notify_one();
+        self.proceed.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.proceed.notify_one();
     }
 }
 
@@ -239,6 +272,44 @@ async fn start_or_steer(
     request: TurnInputRequest,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    start_or_steer_with_task(session, request, submission_id, RegularTask::new()).await
+}
+
+async fn start_or_steer_with_task<T: SessionTask>(
+    session: &Arc<Session>,
+    request: TurnInputRequest,
+    submission_id: String,
+    task: T,
+) -> CodexResult<TurnInputSubmission> {
+    start_or_steer_with_task_inner(
+        session,
+        request,
+        submission_id,
+        task,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn start_or_steer_with_task_and_barrier<T: SessionTask>(
+    session: &Arc<Session>,
+    request: TurnInputRequest,
+    submission_id: String,
+    task: T,
+    barrier: UserStartClaimBarrier,
+) -> CodexResult<TurnInputSubmission> {
+    start_or_steer_with_task_inner(session, request, submission_id, task, Some(barrier)).await
+}
+
+async fn start_or_steer_with_task_inner<T: SessionTask>(
+    session: &Arc<Session>,
+    request: TurnInputRequest,
+    submission_id: String,
+    task: T,
+    #[cfg(test)] barrier: Option<UserStartClaimBarrier>,
+) -> CodexResult<TurnInputSubmission> {
     let TurnInputRequest {
         mut input,
         thread_settings,
@@ -266,62 +337,92 @@ async fn start_or_steer(
         .as_ref()
         .map(|_| start.root_turn_id.clone());
     let settings = PreparedTurnInputSettings::prepare(session, thread_settings, start).await?;
-    match session
-        .steer_input(
-            &mut input,
-            additional_context.clone(),
-            /*expected_turn_id*/ None,
-            settings.required_active_final_output_json_schema(),
-            responsesapi_client_metadata.clone(),
-            incoming_root_turn_id,
-        )
+    let (reservation, turn_state) = loop {
+        match session
+            .steer_input(
+                &mut input,
+                additional_context.clone(),
+                /*expected_turn_id*/ None,
+                settings.required_active_final_output_json_schema(),
+                responsesapi_client_metadata.clone(),
+                incoming_root_turn_id.clone(),
+            )
+            .await
+        {
+            Ok(turn_id) => {
+                settings.apply_steered(session, submission_id).await?;
+                return Ok(TurnInputSubmission::Steered { turn_id });
+            }
+            Err(NotSubmittedReason::NoActiveTurn) => {
+                match session
+                    .claim_execution_capacity_for_user_turn_start()
+                    .await?
+                {
+                    UserTurnStartClaim::Claimed {
+                        reservation,
+                        turn_state,
+                    } => break (reservation, turn_state),
+                    UserTurnStartClaim::SteerNow => continue,
+                    UserTurnStartClaim::WaitForTask(claim) => match claim.wait().await {
+                        TasklessTurnClaimStatus::Running | TasklessTurnClaimStatus::Cancelled => {
+                            continue;
+                        }
+                        TasklessTurnClaimStatus::Starting => {
+                            unreachable!("taskless claim wait must resolve")
+                        }
+                    },
+                }
+            }
+            Err(reason) => return Ok(TurnInputSubmission::NotSubmitted { reason }),
+        }
+    };
+    #[cfg(test)]
+    if let Some(barrier) = barrier {
+        barrier.pause_after_claim().await;
+    }
+    let turn_context = match settings
+        .apply_started(session, submission_id.clone(), TurnStartKind::User)
         .await
     {
-        Ok(turn_id) => {
-            settings.apply_steered(session, submission_id).await?;
-            Ok(TurnInputSubmission::Steered { turn_id })
+        Ok(Some(turn_context)) => turn_context,
+        Ok(None) => unreachable!("explicit user input can enter Plan mode"),
+        Err(error) => {
+            session.clear_reserved_idle_turn(&turn_state).await;
+            return Err(error);
         }
-        Err(NotSubmittedReason::NoActiveTurn) => {
-            let Some(turn_context) = settings
-                .apply_started(session, submission_id.clone(), TurnStartKind::User)
-                .await?
-            else {
-                unreachable!("explicit user input can enter Plan mode");
-            };
-            if can_start_root_turn
-                && has_explicit_input
-                && turn_context
-                    .turn_metadata_state
-                    .can_start_root_turn(&turn_context.session_source)
-            {
-                turn_context
-                    .turn_metadata_state
-                    .set_root_turn_id(submission_id.clone());
-            }
-            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-                turn_context
-                    .turn_metadata_state
-                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
-            }
-            session
-                .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
-                .await;
-            if let SubmittedTurnInput::UserInput { content, .. } = &input {
-                turn_context.session_telemetry.user_prompt(content);
-            }
-            let mut task_input = merge_additional_context_input(session, additional_context).await;
-            if has_explicit_input {
-                task_input.push(pending_turn_input(input));
-            }
-            session
-                .spawn_task(turn_context, task_input, RegularTask::new())
-                .await;
-            Ok(TurnInputSubmission::Started {
-                turn_id: submission_id,
-            })
-        }
-        Err(reason) => Ok(TurnInputSubmission::NotSubmitted { reason }),
+    };
+    if can_start_root_turn
+        && has_explicit_input
+        && turn_context
+            .turn_metadata_state
+            .can_start_root_turn(&turn_context.session_source)
+    {
+        turn_context
+            .turn_metadata_state
+            .set_root_turn_id(submission_id.clone());
     }
+    if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+        turn_context
+            .turn_metadata_state
+            .set_responsesapi_client_metadata(responsesapi_client_metadata);
+    }
+    session
+        .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+        .await;
+    if let SubmittedTurnInput::UserInput { content, .. } = &input {
+        turn_context.session_telemetry.user_prompt(content);
+    }
+    let mut task_input = merge_additional_context_input(session, additional_context).await;
+    if has_explicit_input {
+        task_input.push(pending_turn_input(input));
+    }
+    session.clear_connector_selection().await;
+    session
+        .start_task_with_reservation(turn_context, task_input, task, reservation)
+        .await;
+    Ok(TurnInputSubmission::Started {
+        turn_id: submission_id,
+    })
 }
 
 async fn start_if_idle(
@@ -354,6 +455,9 @@ async fn start_if_idle(
         });
     }
 
+    let mut reservation = session.reserve_execution_capacity_for_turn_start().await?;
+    let taskless_claim = reservation.ensure_taskless_claim();
+
     let turn_state = {
         let mut active_turn = session.active_turn.lock().await;
         if active_turn.is_some() {
@@ -361,7 +465,8 @@ async fn start_if_idle(
                 reason: NotSubmittedReason::NotIdle,
             });
         }
-        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+        let active_turn = active_turn
+            .get_or_insert_with(|| ActiveTurn::with_taskless_start_claim(taskless_claim));
         Arc::clone(&active_turn.turn_state)
     };
 
@@ -441,7 +546,7 @@ async fn start_if_idle(
         }
     }
     session
-        .start_task(turn_context, task_input, RegularTask::new())
+        .start_task_with_reservation(turn_context, task_input, RegularTask::new(), reservation)
         .await;
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
@@ -492,6 +597,22 @@ async fn steer(
 }
 
 impl Session {
+    #[cfg(test)]
+    pub(crate) fn new_user_start_claim_barrier() -> UserStartClaimBarrier {
+        UserStartClaimBarrier::new()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_or_steer_with_task_and_barrier<T: SessionTask>(
+        self: &Arc<Self>,
+        request: TurnInputRequest,
+        submission_id: String,
+        task: T,
+        barrier: UserStartClaimBarrier,
+    ) -> CodexResult<TurnInputSubmission> {
+        start_or_steer_with_task_and_barrier(self, request, submission_id, task, barrier).await
+    }
+
     pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
         let submission_id = Uuid::now_v7().to_string();
         let submission = handle(

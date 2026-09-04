@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
@@ -1156,6 +1157,7 @@ async fn grandchild_full_fork_preserves_context_baseline(
     const COMPACT_PROMPT: &str = "CONTEXT_BASELINE_COMPACTION_PROMPT";
     const COMPACT_SUMMARY: &str = "CONTEXT_BASELINE_COMPACTION_SUMMARY";
     const PRELUDE_CALL: &str = "context-baseline-prelude-call";
+    const DESCENDANT_INTEGRATION_WAIT: Duration = Duration::from_secs(30);
 
     let server = start_mock_server().await;
     let (parent_fork_turns, compact_parent) = match parent_context {
@@ -1309,7 +1311,7 @@ async fn grandchild_full_fork_preserves_context_baseline(
         (&child_log, "/root/child"),
         (&grandchild_log, "/root/child/grandchild"),
     ] {
-        let request = timeout(Duration::from_secs(/*secs*/ 10), async {
+        let request = timeout(DESCENDANT_INTEGRATION_WAIT, async {
             loop {
                 let request = mock.requests().into_iter().find(|request| {
                     request.body_json()["client_metadata"]["x-codex-turn-metadata"]
@@ -1324,19 +1326,25 @@ async fn grandchild_full_fork_preserves_context_baseline(
                 sleep(Duration::from_millis(/*millis*/ 10)).await;
             }
         })
-        .await?;
+        .await
+        .context(format!(
+            "timed out waiting for {agent_name} descendant request; parent_context={parent_context:?}, history_mode={history_mode:?}"
+        ))?;
         let thread_id = ThreadId::from_string(
             request.body_json()["client_metadata"]["thread_id"]
                 .as_str()
                 .expect("descendant thread id"),
         )?;
         let thread = test.thread_manager.get_thread(thread_id).await?;
-        timeout(Duration::from_secs(/*secs*/ 10), async {
+        timeout(DESCENDANT_INTEGRATION_WAIT, async {
             while !matches!(thread.agent_status().await, AgentStatus::Completed(_)) {
                 sleep(Duration::from_millis(/*millis*/ 10)).await;
             }
         })
-        .await?;
+        .await
+        .context(format!(
+            "timed out waiting for {agent_name} descendant completion; parent_context={parent_context:?}, history_mode={history_mode:?}"
+        ))?;
         descendant_requests.push(request);
     }
     let context_counts = [
@@ -2632,6 +2640,817 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
         assert!(completed_activity_started.is_none());
         assert!(completed_activity_completed.is_none());
     }
+
+    Ok(())
+}
+
+fn request_thread_id(req: &wiremock::Request) -> Option<String> {
+    decoded_body(req)
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .and_then(|body| {
+            let turn_metadata = body
+                .get("client_metadata")?
+                .get("x-codex-turn-metadata")?
+                .as_str()?;
+            serde_json::from_str::<Value>(turn_metadata)
+                .ok()?
+                .get("thread_id")?
+                .as_str()
+                .map(str::to_string)
+        })
+}
+
+fn request_matches_thread_and_markers(
+    request: &wiremock::Request,
+    thread_id: &str,
+    required_markers: &[&str],
+    forbidden_markers: &[&str],
+) -> bool {
+    request_thread_id(request).as_deref() == Some(thread_id)
+        && required_markers
+            .iter()
+            .all(|marker| body_contains(request, marker))
+        && forbidden_markers
+            .iter()
+            .all(|marker| !body_contains(request, marker))
+}
+
+async fn wait_for_requests_for_thread_with_markers(
+    server: &MockServer,
+    thread_id: &str,
+    required_markers: &[&str],
+    forbidden_markers: &[&str],
+) -> Result<Vec<wiremock::Request>> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let requests = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| {
+                request_matches_thread_and_markers(
+                    request,
+                    thread_id,
+                    required_markers,
+                    forbidden_markers,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !requests.is_empty() {
+            return Ok(requests);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for request from thread {thread_id} with required markers {required_markers:?} and forbidden markers {forbidden_markers:?}"
+            );
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_direct_child_thread_id(
+    test: &TestCodex,
+    parent_thread_id: ThreadId,
+) -> Result<ThreadId> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        for thread_id in test.thread_manager.list_thread_ids().await {
+            if thread_id == parent_thread_id {
+                continue;
+            }
+            let thread = test.thread_manager.get_thread(thread_id).await?;
+            if thread.config_snapshot().await.parent_thread_id == Some(parent_thread_id) {
+                return Ok(thread_id);
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for direct child of {parent_thread_id}");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[test]
+fn multi_agent_v2_join_completion_defers_to_active_user_turn_then_wakes_once() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+    let handle = std::thread::Builder::new()
+        .name("join-active-user-priority-fixture".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(TEST_STACK_SIZE_BYTES)
+                .enable_all()
+                .build()?;
+            runtime.block_on(join_completion_defers_to_active_user_turn_fixture())
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "join active-user-priority fixture thread panicked"
+        )),
+    }
+}
+
+async fn join_completion_defers_to_active_user_turn_fixture() -> Result<()> {
+    const ROOT_PROMPT: &str = "arm a direct owned join for the user-priority fixture";
+    const CHILD_TASK: &str = "finish after the explicit user turn has started";
+    const USER_PROMPT: &str = "explicit user steering owns the next root turn";
+    const ROOT_SPAWN_CALL: &str = "user-priority-root-spawn";
+    const ROOT_JOIN_CALL: &str = "user-priority-root-join";
+    const ROOT_ARMED: &str = "USER_PRIORITY_ROOT_ARMED";
+    const CHILD_FINAL: &str = "USER_PRIORITY_CHILD_FINAL";
+    const USER_FINAL: &str = "USER_PRIORITY_USER_FINAL";
+    const ROOT_CONTINUATION_FINAL: &str = "USER_PRIORITY_JOIN_CONTINUATION_FINAL";
+
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_TASK,
+        "task_name": "priority_child",
+        "fork_turns": "none",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, ROOT_PROMPT) && !body_contains(request, ROOT_SPAWN_CALL)
+        },
+        sse(vec![
+            ev_response_created("resp-user-priority-root-spawn"),
+            ev_function_call_with_namespace(
+                ROOT_SPAWN_CALL,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-user-priority-root-spawn"),
+        ]),
+    )
+    .await;
+
+    let _child_final = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, CHILD_TASK) && request_has_input_type(request, "agent_message")
+        },
+        sse_response(sse(vec![
+            ev_response_created("resp-user-priority-child-final"),
+            ev_assistant_message("msg-user-priority-child-final", CHILD_FINAL),
+            ev_completed("resp-user-priority-child-final"),
+        ]))
+        .set_delay(Duration::from_secs(3)),
+    )
+    .await;
+
+    let join_args = serde_json::to_string(&json!({
+        "targets": ["priority_child"],
+        "condition": "all",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, ROOT_SPAWN_CALL) && !body_contains(request, ROOT_JOIN_CALL)
+        },
+        sse(vec![
+            ev_response_created("resp-user-priority-root-join"),
+            ev_function_call(ROOT_JOIN_CALL, "join_agents", &join_args),
+            ev_completed("resp-user-priority-root-join"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, ROOT_JOIN_CALL)
+                && !body_contains(request, CHILD_FINAL)
+                && !body_contains(request, USER_PROMPT)
+        },
+        sse(vec![
+            ev_response_created("resp-user-priority-root-armed"),
+            ev_assistant_message("msg-user-priority-root-armed", ROOT_ARMED),
+            ev_completed("resp-user-priority-root-armed"),
+        ]),
+    )
+    .await;
+
+    let test = test_codex()
+        .with_model(V2_DEFAULT_MODEL)
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_provider.supports_websockets = false;
+            config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
+        })
+        .build(&server)
+        .await?;
+    let root_thread_id = test.session_configured.thread_id.to_string();
+
+    let user_root_thread_id = root_thread_id.clone();
+    let _user_turn = mount_response_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request_thread_id(request).as_deref() == Some(user_root_thread_id.as_str())
+                && body_contains(request, USER_PROMPT)
+                && !body_contains(request, CHILD_FINAL)
+        },
+        sse_response(sse(vec![
+            ev_response_created("resp-user-priority-user-turn"),
+            ev_assistant_message("msg-user-priority-user-turn", USER_FINAL),
+            ev_completed("resp-user-priority-user-turn"),
+        ]))
+        .set_delay(Duration::from_secs(5)),
+    )
+    .await;
+
+    let continuation_root_thread_id = root_thread_id.clone();
+    let _root_continuation = mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request_thread_id(request).as_deref() == Some(continuation_root_thread_id.as_str())
+                && body_contains(request, ROOT_JOIN_CALL)
+                && body_contains(request, CHILD_FINAL)
+                && !body_contains(request, ROOT_CONTINUATION_FINAL)
+        },
+        sse(vec![
+            ev_response_created("resp-user-priority-root-continuation"),
+            ev_assistant_message(
+                "msg-user-priority-root-continuation",
+                ROOT_CONTINUATION_FINAL,
+            ),
+            ev_completed("resp-user-priority-root-continuation"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: ROOT_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let root_initial_turn = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == root_initial_turn => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let child_thread_id =
+        wait_for_direct_child_thread_id(&test, test.session_configured.thread_id).await?;
+    let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
+
+    test.codex
+        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: USER_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let user_turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) if event.turn_id != root_initial_turn => {
+            Some(event.turn_id.clone())
+        }
+        _ => None,
+    })
+    .await;
+
+    timeout(Duration::from_secs(8), async {
+        loop {
+            if matches!(child_thread.agent_status().await, AgentStatus::Completed(_)) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("child should become terminal while the explicit user turn is active")?;
+
+    let early_join_continuation = timeout(
+        Duration::from_millis(300),
+        wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::TurnStarted(event)
+                if event.turn_id != root_initial_turn && event.turn_id != user_turn_id =>
+            {
+                Some(event.turn_id.clone())
+            }
+            _ => None,
+        }),
+    )
+    .await;
+    assert!(
+        early_join_continuation.is_err(),
+        "owned join continuation must not preempt the active explicit user turn"
+    );
+
+    let user_complete = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == user_turn_id => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        user_complete.last_agent_message.as_deref(),
+        Some(USER_FINAL)
+    );
+
+    let continuation_turn_id = timeout(
+        Duration::from_secs(5),
+        wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::TurnStarted(event)
+                if event.turn_id != root_initial_turn && event.turn_id != user_turn_id =>
+            {
+                Some(event.turn_id.clone())
+            }
+            _ => None,
+        }),
+    )
+    .await
+    .context("terminal owned join should wake once after the explicit user turn completes")?;
+    let continuation_complete = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == continuation_turn_id => {
+            Some(event.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        continuation_complete.last_agent_message.as_deref(),
+        Some(ROOT_CONTINUATION_FINAL)
+    );
+    assert_eq!(
+        wait_for_requests_for_thread_with_markers(
+            &server,
+            &root_thread_id,
+            &[USER_PROMPT],
+            &[CHILD_FINAL],
+        )
+        .await
+        .context("explicit user response was not requested")?
+        .len(),
+        1
+    );
+    assert_eq!(
+        wait_for_requests_for_thread_with_markers(
+            &server,
+            &root_thread_id,
+            &[ROOT_JOIN_CALL, CHILD_FINAL],
+            &[ROOT_CONTINUATION_FINAL],
+        )
+        .await
+        .context("owned join continuation response was not requested")?
+        .len(),
+        1
+    );
+    let duplicate = timeout(Duration::from_millis(300), async {
+        loop {
+            let event = test.codex.next_event().await.expect("next root event");
+            if let EventMsg::TurnStarted(event) = event.msg {
+                break event.turn_id;
+            }
+        }
+    })
+    .await;
+    assert!(duplicate.is_err(), "owned join must not wake twice");
+
+    Ok(())
+}
+
+#[test]
+fn multi_agent_v2_recursive_owned_join_wakes_root_after_child_continuation() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+    let handle = std::thread::Builder::new()
+        .name("recursive-owned-join-fixture".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(TEST_STACK_SIZE_BYTES)
+                .enable_all()
+                .build()?;
+            runtime.block_on(multi_agent_v2_recursive_owned_join_fixture())
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "recursive owned-join fixture thread panicked"
+        )),
+    }
+}
+
+async fn multi_agent_v2_recursive_owned_join_fixture() -> Result<()> {
+    const ROOT_PROMPT: &str = "run the recursive owned-join lifecycle fixture";
+    const BRANCH_TASK: &str = "own the leaf and synthesize its terminal result";
+    const LEAF_TASK: &str = "emit the recursive leaf terminal";
+    const ROOT_SPAWN_CALL: &str = "recursive-root-spawn-branch";
+    const ROOT_JOIN_CALL: &str = "recursive-root-join-branch";
+    const BRANCH_SPAWN_CALL: &str = "recursive-branch-spawn-leaf";
+    const BRANCH_JOIN_CALL: &str = "recursive-branch-join-leaf";
+    const ROOT_ARMED: &str = "RECURSIVE_ROOT_A0_ARMED";
+    const BRANCH_INITIAL_FINAL: &str = "RECURSIVE_BRANCH_B1_ORDINARY_FINAL";
+    const LEAF_FINAL: &str = "RECURSIVE_LEAF_C_FINAL";
+    const BRANCH_CONTINUATION_FINAL: &str = "RECURSIVE_BRANCH_B2_MATERIAL_FINAL";
+    const ROOT_INTERMEDIATE_FINAL: &str = "RECURSIVE_ROOT_A1_INTERMEDIATE_FINAL";
+    const ROOT_CONTINUATION_FINAL: &str = "RECURSIVE_ROOT_A2_MATERIAL_FINAL";
+    const UNEXPECTED_ROOT_FROM_C: &str = "UNEXPECTED_C_TO_ROOT_BYPASS";
+
+    let server = start_mock_server().await;
+    let branch_spawn_args = serde_json::to_string(&json!({
+        "message": BRANCH_TASK,
+        "task_name": "branch",
+        "fork_turns": "none",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, ROOT_PROMPT) && !body_contains(request, ROOT_SPAWN_CALL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-root-spawn"),
+            ev_function_call_with_namespace(
+                ROOT_SPAWN_CALL,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &branch_spawn_args,
+            ),
+            ev_completed("resp-recursive-root-spawn"),
+        ]),
+    )
+    .await;
+
+    let leaf_spawn_args = serde_json::to_string(&json!({
+        "message": LEAF_TASK,
+        "task_name": "leaf",
+        "fork_turns": "none",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, BRANCH_TASK)
+                && request_has_input_type(request, "agent_message")
+                && !body_contains(request, BRANCH_SPAWN_CALL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-branch-spawn"),
+            ev_function_call_with_namespace(
+                BRANCH_SPAWN_CALL,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &leaf_spawn_args,
+            ),
+            ev_completed("resp-recursive-branch-spawn"),
+        ]),
+    )
+    .await;
+
+    let root_join_args = serde_json::to_string(&json!({
+        "targets": ["branch"],
+        "condition": "all",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, ROOT_SPAWN_CALL) && !body_contains(request, ROOT_JOIN_CALL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-root-join"),
+            ev_function_call(ROOT_JOIN_CALL, "join_agents", &root_join_args),
+            ev_completed("resp-recursive-root-join"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, ROOT_JOIN_CALL) && !body_contains(request, BRANCH_INITIAL_FINAL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-root-armed"),
+            ev_assistant_message("msg-recursive-root-armed", ROOT_ARMED),
+            ev_completed("resp-recursive-root-armed"),
+        ]),
+    )
+    .await;
+
+    let branch_join_args = serde_json::to_string(&json!({
+        "targets": ["leaf"],
+        "condition": "all",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, BRANCH_SPAWN_CALL) && !body_contains(request, BRANCH_JOIN_CALL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-branch-join"),
+            ev_function_call(BRANCH_JOIN_CALL, "join_agents", &branch_join_args),
+            ev_completed("resp-recursive-branch-join"),
+        ]),
+    )
+    .await;
+    let _branch_initial_final = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, BRANCH_JOIN_CALL) && !body_contains(request, LEAF_FINAL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-branch-initial-final"),
+            ev_assistant_message("msg-recursive-branch-initial-final", BRANCH_INITIAL_FINAL),
+            ev_completed("resp-recursive-branch-initial-final"),
+        ]),
+    )
+    .await;
+
+    let _leaf_final = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, LEAF_TASK) && request_has_input_type(request, "agent_message")
+        },
+        sse_response(sse(vec![
+            ev_response_created("resp-recursive-leaf-final"),
+            ev_assistant_message("msg-recursive-leaf-final", LEAF_FINAL),
+            ev_completed("resp-recursive-leaf-final"),
+        ]))
+        .set_delay(Duration::from_secs(3)),
+    )
+    .await;
+
+    let test = test_codex()
+        .with_model(V2_DEFAULT_MODEL)
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_provider.supports_websockets = false;
+            config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
+        })
+        .build(&server)
+        .await?;
+    let root_thread_id = test.session_configured.thread_id.to_string();
+
+    let root_thread_id_for_b1 = root_thread_id.clone();
+    let _root_intermediate = mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request_thread_id(request).as_deref() == Some(root_thread_id_for_b1.as_str())
+                && body_contains(request, ROOT_JOIN_CALL)
+                && body_contains(request, BRANCH_INITIAL_FINAL)
+                && !body_contains(request, BRANCH_CONTINUATION_FINAL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-root-intermediate"),
+            ev_assistant_message("msg-recursive-root-intermediate", ROOT_INTERMEDIATE_FINAL),
+            ev_completed("resp-recursive-root-intermediate"),
+        ]),
+    )
+    .await;
+    let root_thread_id_for_c = root_thread_id.clone();
+    let _unexpected_root_from_c = mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request_thread_id(request).as_deref() == Some(root_thread_id_for_c.as_str())
+                && body_contains(request, ROOT_JOIN_CALL)
+                && body_contains(request, LEAF_FINAL)
+                && !body_contains(request, BRANCH_CONTINUATION_FINAL)
+        },
+        sse(vec![
+            ev_response_created("resp-unexpected-root-from-c"),
+            ev_assistant_message("msg-unexpected-root-from-c", UNEXPECTED_ROOT_FROM_C),
+            ev_completed("resp-unexpected-root-from-c"),
+        ]),
+    )
+    .await;
+    let _branch_continuation = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, BRANCH_JOIN_CALL) && body_contains(request, LEAF_FINAL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-branch-continuation"),
+            ev_assistant_message(
+                "msg-recursive-branch-continuation",
+                BRANCH_CONTINUATION_FINAL,
+            ),
+            ev_completed("resp-recursive-branch-continuation"),
+        ]),
+    )
+    .await;
+    let root_thread_id_for_continuation = root_thread_id.clone();
+    let _root_continuation = mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request_thread_id(request).as_deref() == Some(root_thread_id_for_continuation.as_str())
+                && body_contains(request, ROOT_JOIN_CALL)
+                && body_contains(request, BRANCH_CONTINUATION_FINAL)
+                && !body_contains(request, LEAF_FINAL)
+        },
+        sse(vec![
+            ev_response_created("resp-recursive-root-continuation"),
+            ev_assistant_message("msg-recursive-root-continuation", ROOT_CONTINUATION_FINAL),
+            ev_completed("resp-recursive-root-continuation"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: ROOT_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let root_initial_turn = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == root_initial_turn => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let branch_thread_id =
+        wait_for_direct_child_thread_id(&test, test.session_configured.thread_id).await?;
+    let branch_thread = test.thread_manager.get_thread(branch_thread_id).await?;
+    let branch_status = timeout(Duration::from_secs(5), async {
+        loop {
+            let status = branch_thread.agent_status().await;
+            if matches!(status, AgentStatus::Completed(_)) {
+                break status;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("B1 should ordinary-complete before C becomes terminal");
+    assert_eq!(
+        branch_status,
+        AgentStatus::Completed(Some(BRANCH_INITIAL_FINAL.to_string()))
+    );
+
+    let root_intermediate_turn = timeout(
+        Duration::from_secs(2),
+        wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::TurnStarted(event) if event.turn_id != root_initial_turn => {
+                Some(event.turn_id.clone())
+            }
+            _ => None,
+        }),
+    )
+    .await
+    .expect("B1 intermediate completion should queue exactly one A1 continuation");
+    let root_intermediate_complete = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == root_intermediate_turn => {
+            Some(event.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        root_intermediate_complete.last_agent_message.as_deref(),
+        Some(ROOT_INTERMEDIATE_FINAL)
+    );
+    assert_eq!(
+        wait_for_requests_for_thread_with_markers(
+            &server,
+            &root_thread_id,
+            &[ROOT_JOIN_CALL, BRANCH_INITIAL_FINAL],
+            &[BRANCH_CONTINUATION_FINAL, LEAF_FINAL],
+        )
+        .await
+        .context("A1 intermediate continuation response was not requested")?
+        .len(),
+        1
+    );
+
+    let leaf_thread_id = wait_for_direct_child_thread_id(&test, branch_thread_id).await?;
+    assert_eq!(
+        wait_for_requests_for_thread_with_markers(
+            &server,
+            &leaf_thread_id.to_string(),
+            &[LEAF_TASK],
+            &[],
+        )
+        .await
+        .context("C material-final response was not requested")?
+        .len(),
+        1
+    );
+    let leaf_thread = test.thread_manager.get_thread(leaf_thread_id).await?;
+    let leaf_status = timeout(Duration::from_secs(5), async {
+        loop {
+            let status = leaf_thread.agent_status().await;
+            if matches!(status, AgentStatus::Completed(_)) {
+                break status;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("C did not reach material terminal completion")?;
+    assert_eq!(
+        leaf_status,
+        AgentStatus::Completed(Some(LEAF_FINAL.to_string()))
+    );
+    assert_eq!(
+        wait_for_requests_for_thread_with_markers(
+            &server,
+            &branch_thread_id.to_string(),
+            &[BRANCH_JOIN_CALL, LEAF_FINAL],
+            &[BRANCH_CONTINUATION_FINAL],
+        )
+        .await
+        .context("B2 continuation response was not requested")?
+        .len(),
+        1
+    );
+    let root_continuation_turn = timeout(
+        Duration::from_secs(10),
+        wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::TurnStarted(event)
+                if event.turn_id != root_initial_turn
+                    && event.turn_id != root_intermediate_turn =>
+            {
+                Some(event.turn_id.clone())
+            }
+            _ => None,
+        }),
+    )
+    .await
+    .expect("B2 material final should queue exactly one A2 continuation");
+    let root_complete = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == root_continuation_turn => {
+            Some(event.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        root_complete.last_agent_message.as_deref(),
+        Some(ROOT_CONTINUATION_FINAL)
+    );
+    assert_eq!(
+        wait_for_requests_for_thread_with_markers(
+            &server,
+            &root_thread_id,
+            &[ROOT_JOIN_CALL, BRANCH_CONTINUATION_FINAL],
+            &[LEAF_FINAL, ROOT_CONTINUATION_FINAL],
+        )
+        .await
+        .context("A2 continuation response was not requested")?
+        .len(),
+        1
+    );
+
+    let unexpected_third_turn = timeout(Duration::from_millis(300), async {
+        loop {
+            let event = test.codex.next_event().await.expect("next root event");
+            if let EventMsg::TurnStarted(event) = event.msg {
+                break event.turn_id;
+            }
+        }
+    })
+    .await;
+    assert!(
+        unexpected_third_turn.is_err(),
+        "recursive owned join must not produce an A3 duplicate"
+    );
+    let bypass_requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request_matches_thread_and_markers(
+                request,
+                &root_thread_id,
+                &[ROOT_JOIN_CALL, LEAF_FINAL],
+                &[BRANCH_CONTINUATION_FINAL],
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        bypass_requests.is_empty(),
+        "C completion must not bypass B and dispatch directly to A"
+    );
 
     Ok(())
 }

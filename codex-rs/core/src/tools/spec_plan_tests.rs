@@ -2726,7 +2726,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         });
     })
     .await;
-    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
+    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, "join_agents"]);
     assert!(v2.can_manage_children);
     v2.assert_visible_lacks(&[
         "spawn_agent",
@@ -2799,7 +2799,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         });
     })
     .await;
-    direct_model_only.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
+    direct_model_only.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, "join_agents"]);
     direct_model_only.assert_visible_lacks(&["spawn_agent", "send_message", "wait_agent"]);
     assert_eq!(
         direct_model_only
@@ -2861,6 +2861,7 @@ async fn multi_agent_v2_can_disable_wait_agent() {
         ]
     );
     plan.assert_visible_lacks(&["clock"]);
+    plan.assert_visible_contains(&["join_agents"]);
     plan.assert_registered_lacks(&["collaboration.wait_agent", "clock.sleep"]);
     assert!(plan.can_manage_children);
 }
@@ -2958,6 +2959,7 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
         "followup_task",
         "wait_agent",
         "interrupt_agent",
+        "join_agents",
         "list_agents",
     ] {
         namespaced.assert_visible_lacks(&[tool_name]);
@@ -3247,6 +3249,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
             "request_user_input",
             // Multi-agent v2 tools.
             MULTI_AGENT_V2_NAMESPACE,
+            "join_agents",
             // Hosted Responses tools.
             "web_search",
         ]

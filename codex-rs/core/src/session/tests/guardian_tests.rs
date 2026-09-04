@@ -621,25 +621,6 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    let active_turn = crate::state::ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&active_turn.turn_state);
-    *session.active_turn.lock().await = Some(active_turn);
-    session
-        .record_granted_request_permissions_for_turn(
-            &RequestPermissionsResponse {
-                permissions: RequestPermissionProfile {
-                    network: Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    ..Default::default()
-                },
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: true,
-            },
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
-            Some(&originating_turn_state),
-        )
-        .await;
 
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
@@ -682,6 +663,35 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
+        )
+        .await;
+
+    let active_task_turn_state = {
+        let active_turn = session.active_turn.lock().await;
+        let active_turn = active_turn
+            .as_ref()
+            .expect("active turn should be installed");
+        let active_task = active_turn
+            .task
+            .as_ref()
+            .expect("active task should be running");
+        assert_eq!(active_task.turn_context.sub_id, turn_context.sub_id);
+        Arc::clone(&active_turn.turn_state)
+    };
+    session
+        .record_granted_request_permissions_for_turn(
+            &RequestPermissionsResponse {
+                permissions: RequestPermissionProfile {
+                    network: Some(NetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    ..Default::default()
+                },
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: true,
+            },
+            codex_exec_server::LOCAL_ENVIRONMENT_ID,
+            Some(&active_task_turn_state),
         )
         .await;
 

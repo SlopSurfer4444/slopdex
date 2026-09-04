@@ -17,6 +17,8 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
+use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -131,6 +133,72 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
         },
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
+}
+
+#[tokio::test]
+async fn residency_preserves_idle_v2_agent_with_owned_join_state() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
+    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let state = control.upgrade().expect("thread manager should be live");
+
+    let first_slot = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("first resident slot");
+    let first = spawn_v2_subagent(
+        &control,
+        &state,
+        config.clone(),
+        root.thread_id,
+        "join-owner",
+    )
+    .await;
+    first_slot.commit(first.thread_id);
+    mark_thread_completed(first.thread.as_ref()).await;
+
+    let target_thread_id = ThreadId::new();
+    let target_identity: Arc<dyn Any + Send + Sync> = Arc::new(());
+    first
+        .thread
+        .session
+        .input_queue
+        .register_join_obligation(
+            first.thread_id,
+            "join-owner-turn".to_string(),
+            HashMap::from([(
+                target_thread_id,
+                (target_identity, "target-turn".to_string()),
+            )]),
+        )
+        .await
+        .expect("owned join registration");
+
+    let reservation = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await;
+    match reservation {
+        Err(err) => match err.details() {
+            CodexErrorDetails::AgentLimitReached { max_threads } => assert_eq!(*max_threads, 1),
+            _ => panic!("expected AgentLimitReached, got {err:?}"),
+        },
+        Ok(_) => panic!("an idle owned-join coordinator must not be evicted"),
+    }
+    assert!(manager.get_thread(first.thread_id).await.is_ok());
 }
 
 async fn spawn_v2_subagent(

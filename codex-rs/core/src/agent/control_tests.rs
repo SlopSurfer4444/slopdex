@@ -9,11 +9,22 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
+use crate::config::ThreadStoreConfig;
 use crate::context::ContextualUserFragment;
 use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
+use crate::session::TurnInput;
+use crate::session::turn_context::TurnContext;
+use crate::state::ActiveTurn;
+use crate::state::TaskKind;
+use crate::tasks::AgentExecutionReservation;
+use crate::tasks::PendingWakeClaimBarrier;
+use crate::tasks::SessionTask;
+use crate::tasks::SessionTaskResult;
+use crate::tasks::TaskStartCommitBarrier;
+use crate::tasks::UserTurnStartClaim;
 use crate::thread_manager::StartThreadOptions;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use assert_matches::assert_matches;
@@ -51,6 +62,7 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -75,6 +87,7 @@ use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 
 async fn test_config_with_cli_overrides(
@@ -188,6 +201,14 @@ impl AgentControlHarness {
     }
 
     async fn new_with_config(home: TempDir, config: Config) -> Self {
+        Self::new_with_config_and_thread_id_generator(home, config, ThreadId::new).await
+    }
+
+    async fn new_with_config_and_thread_id_generator(
+        home: TempDir,
+        config: Config,
+        generator: impl Fn() -> ThreadId + Send + Sync + 'static,
+    ) -> Self {
         let state_db = init_state_db(&config).await;
         let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
             CodexAuth::from_api_key("dummy"),
@@ -195,7 +216,8 @@ impl AgentControlHarness {
             config.codex_home.to_path_buf(),
             std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             state_db.clone(),
-        );
+        )
+        .with_thread_id_generator(generator);
         let control = manager.agent_control();
         Self {
             _home: home,
@@ -342,6 +364,106 @@ async fn wait_for_recorded_user_message(thread: &CodexThread, needle: &str) {
     })
     .await
     .expect("timed out waiting for user message recording");
+}
+
+#[tokio::test]
+async fn stale_edge_parent_mismatch_fails_closed_without_registry_release() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child runtime should exist");
+    child_thread
+        .shutdown_and_wait()
+        .await
+        .expect("child shutdown should complete");
+    assert!(
+        harness
+            .manager
+            .remove_thread(&child_thread_id)
+            .await
+            .is_some(),
+        "stale child runtime should be removed through the manager seam"
+    );
+
+    let wrong_parent_thread_id = ThreadId::new();
+    harness
+        .state_db
+        .as_ref()
+        .expect("state db")
+        .upsert_thread_spawn_edge(
+            wrong_parent_thread_id,
+            child_thread_id,
+            codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("mismatched stale edge should persist");
+
+    let err = harness
+        .control
+        .close_agent(child_thread_id)
+        .await
+        .expect_err("stale parent mismatch must fail closed");
+    assert!(matches!(err.details(), CodexErrorDetails::Fatal(_)));
+    assert!(
+        harness.control.ensure_agent_known(child_thread_id).is_ok(),
+        "registry release must wait for exact stale-edge closure"
+    );
+    assert_eq!(
+        harness
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .list_thread_spawn_children_with_status(
+                wrong_parent_thread_id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("mismatched edge should remain open"),
+        vec![child_thread_id]
+    );
+}
+
+#[tokio::test]
+async fn close_agent_stale_root_without_graph_store_releases_normally() {
+    let (home, config) = test_config().await;
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        /*state_db*/ None,
+    );
+    let control = manager.agent_control();
+    let root = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .expect("root thread should start");
+    control.register_session_root(root.thread_id, None);
+    assert!(control.ensure_agent_known(root.thread_id).is_ok());
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("root shutdown should complete");
+    assert!(manager.remove_thread(&root.thread_id).await.is_some());
+
+    control
+        .close_agent(root.thread_id)
+        .await
+        .expect("stale root close should bypass unavailable graph store");
+    assert!(control.ensure_agent_known(root.thread_id).is_err());
+    drop(home);
 }
 
 fn history_contains_assistant_inter_agent_communication<'a>(
@@ -661,6 +783,142 @@ async fn send_input_submits_user_message() {
         .expect("send_input should succeed");
     assert!(!submission_id.is_empty());
     wait_for_recorded_user_message(thread.as_ref(), "hello from tests").await;
+}
+
+#[tokio::test]
+async fn raw_agent_death_preserves_error_and_releases_exact_runtime() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child runtime should exist");
+    child_thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("child shutdown should submit");
+    child_thread.wait_until_terminated().await;
+
+    let err = harness
+        .control
+        .send_input(
+            child_thread_id,
+            text_input("after death"),
+            Default::default(),
+        )
+        .await
+        .expect_err("raw agent death must remain an error");
+    assert!(
+        matches!(err.details(), CodexErrorDetails::InternalAgentDied),
+        "raw send_input should preserve InternalAgentDied, got err={err:?}, details={:?}",
+        err.details()
+    );
+    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
+    assert!(harness.control.ensure_agent_known(child_thread_id).is_err());
+    assert_eq!(
+        harness
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .list_thread_spawn_children_with_status(
+                parent_thread_id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("closed child edge should load"),
+        vec![child_thread_id]
+    );
+}
+
+#[tokio::test]
+async fn close_agent_propagates_raw_death_after_exact_cleanup() {
+    let (_home, mut config) = test_config().await;
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("close-agent-raw-death-{}", uuid::Uuid::new_v4()),
+    };
+    let state_db = init_state_db(&config).await;
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        crate::thread_manager::build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_store_from_config(&config, state_db.clone()),
+        crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let control = manager.agent_control();
+    let parent_thread_id = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("parent thread should start")
+        .thread_id;
+    let child_thread_id = control
+        .spawn_agent_with_metadata(
+            config.clone(),
+            text_input("child task"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("child thread should start")
+        .thread_id;
+    let child_thread = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child runtime should exist");
+    child_thread.io.tx_sub.close();
+    child_thread.wait_until_terminated().await;
+
+    let err = control
+        .close_agent(child_thread_id)
+        .await
+        .expect_err("close_agent should propagate raw agent death");
+    assert!(
+        matches!(err.details(), CodexErrorDetails::InternalAgentDied),
+        "close_agent should propagate InternalAgentDied, got err={err:?}, details={:?}",
+        err.details()
+    );
+    assert_thread_not_loaded(&manager, child_thread_id).await;
+    assert!(control.ensure_agent_known(child_thread_id).is_err());
+    assert_eq!(
+        state_db
+            .as_ref()
+            .expect("state db")
+            .list_thread_spawn_children_with_status(
+                parent_thread_id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("closed child edge should load"),
+        vec![child_thread_id]
+    );
 }
 
 #[tokio::test]
@@ -3610,7 +3868,14 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
 
 #[tokio::test]
 async fn resume_thread_subagent_restores_stored_metadata() {
-    let (home, config) = test_config().await;
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let state_db = init_state_db(&config)
+        .await
+        .expect("sqlite state db should initialize");
     let thread_store = Arc::new(InMemoryThreadStore::default());
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = ThreadManager::new(
@@ -3624,7 +3889,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         thread_store.clone(),
-        /*agent_graph_store*/ None,
+        crate::local_agent_graph_store_from_state_db(Some(&state_db)),
         uuid::Uuid::new_v4().to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
@@ -3633,7 +3898,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let harness = AgentControlHarness {
         _home: home,
         config,
-        state_db: None,
+        state_db: Some(state_db),
         manager,
         control,
     };
@@ -4751,3 +5016,6 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .await
         .expect("tree shutdown after partial subtree resume should succeed");
 }
+
+#[path = "control/owned_join_tests.rs"]
+mod owned_join_tests;

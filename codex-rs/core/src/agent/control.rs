@@ -62,16 +62,25 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
+use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tracing::warn;
 use uuid::Uuid;
 
+use self::capacity_ready::CapacityReadyLease;
+#[cfg(test)]
+use self::capacity_ready::CapacityReadyLeaseRetirementWatch;
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
+pub(crate) use self::owned_join::ExactJoinTurnTerminal;
+pub(crate) use self::owned_join::RetainedJoinDeliveryState;
 use self::residency::V2Residency;
 
+mod capacity_ready;
 mod execution;
+mod join_observer;
 mod legacy;
+mod owned_join;
 mod residency;
 mod service_tier;
 mod spawn;
@@ -129,6 +138,15 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
+    /// Capacity-blocked trigger turns retained until the limiter publishes a release.
+    capacity_ready_leases: Arc<Mutex<Vec<CapacityReadyLease>>>,
+    #[cfg(test)]
+    capacity_ready_barrier: Arc<Mutex<Option<crate::tasks::PendingWakeClaimBarrier>>>,
+    #[cfg(test)]
+    capacity_ready_lease_retirement: Arc<Mutex<Option<CapacityReadyLeaseRetirementWatch>>>,
+    #[cfg(test)]
+    exact_join_observer_receive_barrier:
+        Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     /// The user-selected root routing tier, shared by the entire agent tree.
     root_service_tier: Arc<ArcSwapOption<String>>,
 }
@@ -142,7 +160,6 @@ impl Default for AgentControl {
         )
     }
 }
-
 impl AgentControl {
     /// Construct a new `AgentControl` that can spawn/message agents via the given manager state.
     pub(crate) fn new(
@@ -158,6 +175,13 @@ impl AgentControl {
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
+            capacity_ready_leases: Arc::default(),
+            #[cfg(test)]
+            capacity_ready_barrier: Arc::default(),
+            #[cfg(test)]
+            capacity_ready_lease_retirement: Arc::default(),
+            #[cfg(test)]
+            exact_join_observer_receive_barrier: Arc::default(),
             root_service_tier: Arc::new(ArcSwapOption::from(None)),
         };
         if let Some(rollout_budget) = rollout_budget {
@@ -210,7 +234,7 @@ impl AgentControl {
             )),
             Err(err) => Err(err),
         };
-        self.handle_thread_request_result(agent_id, &state, result)
+        self.handle_thread_request_result(agent_id, &state, Some(&thread), result)
             .await
     }
 
@@ -322,10 +346,12 @@ impl AgentControl {
         } else {
             (None, None)
         };
+        let expected_thread = state.get_thread(agent_id).await.ok();
         let result = self
             .handle_thread_request_result(
                 agent_id,
                 state,
+                expected_thread.as_ref(),
                 state
                     .send_op(
                         agent_id,
@@ -355,9 +381,11 @@ impl AgentControl {
     /// Interrupt the current task for an existing agent thread.
     pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
+        let expected_thread = state.get_thread(agent_id).await?;
         self.handle_thread_request_result(
             agent_id,
             &state,
+            Some(&expected_thread),
             state
                 .send_op(
                     agent_id,
@@ -374,15 +402,36 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
+        expected_thread: Option<&Arc<crate::codex_thread::CodexThread>>,
         result: CodexResult<String>,
     ) -> CodexResult<String> {
         if result
             .as_ref()
             .is_err_and(|err| matches!(err.details(), CodexErrorDetails::InternalAgentDied))
+            && let Some(expected_thread) = expected_thread
         {
-            let _ = state.remove_thread(&agent_id).await;
-            self.forget_v2_residency(agent_id);
-            self.state.release_spawned_thread(agent_id);
+            let expected_incarnation = state
+                .thread_incarnation_for(agent_id, expected_thread)
+                .await;
+            match state
+                .close_spawn_edge_and_remove_if_matches(
+                    agent_id,
+                    expected_thread,
+                    expected_incarnation,
+                )
+                .await
+            {
+                Ok(Some(_)) => {
+                    self.forget_v2_residency(agent_id);
+                    self.state.release_spawned_thread(agent_id);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        "failed to persist raw-death cleanup for thread {agent_id}; retaining runtime: {err}"
+                    );
+                }
+            }
         }
         result
     }
@@ -470,6 +519,20 @@ impl AgentControl {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         Ok(thread.subscribe_status())
+    }
+
+    /// Return the active turn incarnation for a live agent, if one exists.
+    ///
+    /// Callers that wait on an agent must bind to this value before observing
+    /// status: a later turn on the same thread id is a different obligation.
+    pub(crate) async fn active_turn_id(&self, agent_id: ThreadId) -> CodexResult<Option<String>> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        let active_turn = thread.session.active_turn.lock().await;
+        Ok(active_turn
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .map(|task| task.turn_context.sub_id.clone()))
     }
 
     pub(crate) async fn format_environment_context_subagents(
@@ -816,33 +879,57 @@ impl AgentControl {
 
     async fn persist_thread_spawn_edge_for_source(
         &self,
-        child_thread: &crate::CodexThread,
+        child_thread: &Arc<crate::CodexThread>,
         child_thread_id: ThreadId,
         session_source: Option<&SessionSource>,
-    ) {
+    ) -> CodexResult<()> {
         let Some(parent_thread_id) = session_source.and_then(SessionSource::parent_thread_id)
         else {
-            return;
+            return Ok(());
         };
         if child_thread.config_snapshot().await.ephemeral {
-            return;
+            return Ok(());
         }
-        let Ok(state) = self.upgrade() else {
-            return;
-        };
-        let Some(agent_graph_store) = state.agent_graph_store() else {
-            return;
-        };
-        if let Err(err) = agent_graph_store
-            .upsert_thread_spawn_edge(
-                parent_thread_id,
-                child_thread_id,
-                codex_agent_graph_store::ThreadSpawnEdgeStatus::Open,
-            )
+        let state = self.upgrade()?;
+        let registered = state.get_thread(child_thread_id).await.map_err(|_| {
+            CodexErr::InvalidRequest(format!(
+                "thread {child_thread_id} was closed before its spawn edge could be registered"
+            ))
+        })?;
+        if !Arc::ptr_eq(&registered, child_thread) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "thread {child_thread_id} changed generation before its spawn edge could be registered"
+            )));
+        }
+        #[cfg(test)]
+        {
+            let hook = state
+                .registration_before_lifecycle_commit_hook
+                .lock()
+                .await
+                .clone();
+            if let Some((target, entered, release)) = hook
+                && target == child_thread_id
+            {
+                entered.wait().await;
+                release.notified().await;
+            }
+        }
+        if let Err(error) = state
+            .persist_open_spawn_edge_if_matches(parent_thread_id, child_thread_id, child_thread)
             .await
         {
-            warn!("failed to persist thread-spawn edge: {err}");
+            state
+                .remove_runtime_if_matches(child_thread_id, child_thread)
+                .await;
+            if let Err(rollback_error) = child_thread.shutdown_and_wait().await {
+                return Err(CodexErr::Fatal(format!(
+                    "{error}; failed to roll back thread {child_thread_id}: {rollback_error}"
+                )));
+            }
+            return Err(error);
         }
+        Ok(())
     }
 
     async fn live_thread_spawn_descendants(

@@ -695,6 +695,12 @@ impl AgentControl {
             }
             (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), self.clone())).await?,
         };
+        self.persist_thread_spawn_edge_for_source(
+            &new_thread.thread,
+            new_thread.thread_id,
+            notification_source.as_ref(),
+        )
+        .await?;
         agent_metadata.agent_id = Some(new_thread.thread_id);
         reservation.commit(agent_metadata.clone());
         if let Some(residency_slot) = residency_slot {
@@ -738,13 +744,6 @@ impl AgentControl {
         // to subscribe or drain this newly created thread.
         // TODO(jif) add helper for drain
         state.notify_thread_created(new_thread.thread_id);
-
-        self.persist_thread_spawn_edge_for_source(
-            new_thread.thread.as_ref(),
-            new_thread.thread_id,
-            notification_source.as_ref(),
-        )
-        .await;
 
         let start_options = TurnStartOptions {
             parent_turn_id: options.parent_turn_id,
@@ -1242,6 +1241,12 @@ impl AgentControl {
                 client_mcp_extensions: None,
             })
             .await?;
+        self.persist_thread_spawn_edge_for_source(
+            &resumed_thread.thread,
+            resumed_thread.thread_id,
+            Some(&notification_source),
+        )
+        .await?;
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
         reservation.commit(agent_metadata.clone());
@@ -1258,16 +1263,9 @@ impl AgentControl {
                 resumed_thread.thread_id,
                 Some(notification_source.clone()),
                 child_reference,
-                agent_metadata.agent_path.clone(),
+                agent_metadata.agent_path,
             );
         }
-        self.persist_thread_spawn_edge_for_source(
-            resumed_thread.thread.as_ref(),
-            resumed_thread.thread_id,
-            Some(&notification_source),
-        )
-        .await;
-
         Ok((resumed_thread.thread_id, multi_agent_version))
     }
 }

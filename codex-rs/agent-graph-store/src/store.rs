@@ -4,6 +4,7 @@ use std::pin::Pin;
 use codex_protocol::ThreadId;
 
 use crate::AgentGraphStoreResult;
+use crate::ThreadSpawnEdgeCloseOutcome;
 use crate::ThreadSpawnEdgeStatus;
 
 /// Future returned by [`AgentGraphStore`] operations.
@@ -34,6 +35,13 @@ pub trait AgentGraphStore: Send + Sync {
         child_thread_id: ThreadId,
         status: ThreadSpawnEdgeStatus,
     ) -> AgentGraphStoreFuture<'_, ()>;
+
+    /// Close one exact Open parent/child edge and distinguish a new close from confirmation.
+    fn close_open_thread_spawn_edge(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> AgentGraphStoreFuture<'_, ThreadSpawnEdgeCloseOutcome>;
 
     /// List direct spawned children of a parent thread.
     ///

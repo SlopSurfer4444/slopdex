@@ -1,5 +1,6 @@
 use super::AgentControl;
 use crate::codex_thread::CodexThread;
+use crate::tasks::AgentExecutionReservation;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -7,13 +8,28 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use tokio::sync::watch;
 
-#[derive(Default)]
 pub(super) struct AgentExecutionLimiter {
     active: AtomicUsize,
     max_threads: OnceLock<usize>,
+    release_generation: AtomicU64,
+    release_tx: watch::Sender<u64>,
+}
+
+impl Default for AgentExecutionLimiter {
+    fn default() -> Self {
+        let (release_tx, _) = watch::channel(0);
+        Self {
+            active: AtomicUsize::default(),
+            max_threads: OnceLock::new(),
+            release_generation: AtomicU64::default(),
+            release_tx,
+        }
+    }
 }
 
 pub(crate) struct AgentExecutionGuard {
@@ -23,6 +39,12 @@ pub(crate) struct AgentExecutionGuard {
 impl Drop for AgentExecutionGuard {
     fn drop(&mut self) {
         self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+        let generation = self
+            .limiter
+            .release_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        self.limiter.release_tx.send_replace(generation);
     }
 }
 
@@ -59,17 +81,25 @@ impl AgentControl {
         }
     }
 
-    pub(crate) fn execution_guard(
+    pub(crate) fn reserve_execution_capacity(
         &self,
         multi_agent_version: MultiAgentVersion,
         session_source: &SessionSource,
-    ) -> Option<AgentExecutionGuard> {
-        is_execution_limited(multi_agent_version, session_source)
-            .then(|| Arc::clone(&self.agent_execution_limiter).guard())
+    ) -> CodexResult<AgentExecutionReservation> {
+        let guard = if is_execution_limited(multi_agent_version, session_source) {
+            Some(Arc::clone(&self.agent_execution_limiter).try_reserve()?)
+        } else {
+            None
+        };
+        Ok(AgentExecutionReservation::from_agent_control(guard))
     }
 }
 
 impl AgentExecutionLimiter {
+    pub(crate) fn subscribe_release(&self) -> watch::Receiver<u64> {
+        self.release_tx.subscribe()
+    }
+
     pub(super) fn initialize(&self, max_threads: usize) {
         self.max_threads.get_or_init(|| max_threads);
     }
@@ -82,9 +112,25 @@ impl AgentExecutionLimiter {
         self.active.load(Ordering::Acquire) < self.max_threads()
     }
 
-    fn guard(self: Arc<Self>) -> AgentExecutionGuard {
-        self.active.fetch_add(1, Ordering::AcqRel);
-        AgentExecutionGuard { limiter: self }
+    fn try_reserve(self: Arc<Self>) -> CodexResult<AgentExecutionGuard> {
+        let max_threads = self.max_threads();
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= max_threads {
+                return Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
+                    max_threads,
+                }));
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(AgentExecutionGuard { limiter: self }),
+                Err(observed) => active = observed,
+            }
+        }
     }
 }
 

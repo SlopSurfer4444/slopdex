@@ -50,6 +50,45 @@ impl Handler {
         } = invocation;
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
+        let target_ids = if let Some(targets) = args.targets {
+            if targets.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "targets must contain at least one direct child".to_string(),
+                ));
+            }
+            let parent_path = turn
+                .session_source
+                .get_agent_path()
+                .unwrap_or_else(AgentPath::root);
+            let control = &session.services.agent_control;
+            let mut target_ids = Vec::with_capacity(targets.len());
+            let mut seen = std::collections::HashSet::with_capacity(targets.len());
+            for target in targets {
+                let thread_id = resolve_agent_target(&session, &turn, &target).await?;
+                if !seen.insert(thread_id) {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "target `{target}` resolves to a duplicate child"
+                    )));
+                }
+                let metadata = control
+                    .ensure_agent_known(thread_id)
+                    .map_err(|err| collab_agent_error(thread_id, err))?;
+                let child_path = metadata.agent_path.ok_or_else(|| {
+                    FunctionCallError::RespondToModel(format!(
+                        "target `{target}` is missing an agent path"
+                    ))
+                })?;
+                if !super::join::is_direct_child(&parent_path, &child_path) {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "target `{target}` is not a direct child of {parent_path}"
+                    )));
+                }
+                target_ids.push(thread_id);
+            }
+            Some(target_ids)
+        } else {
+            None
+        };
         let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
         let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;
         let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
@@ -64,14 +103,52 @@ impl Handler {
             None => default_timeout_ms,
         };
 
-        let turn_state = session
-            .input_queue
-            .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
-            .await;
-        let (mut activity_rx, pending_activity) = session
-            .input_queue
-            .subscribe_activity(turn_state.as_deref())
-            .await;
+        let mut ready_result = None;
+        if let Some(target_ids) = target_ids.as_ref() {
+            let ready_outcomes = session
+                .services
+                .agent_control
+                .consume_ready_join_obligation_for_targets_with_outcomes(
+                    session.thread_id,
+                    &turn.sub_id,
+                    target_ids,
+                )
+                .await
+                .unwrap_or(None);
+            if let Some(outcomes) = ready_outcomes {
+                let mut result = WaitAgentResult::from_outcome(
+                    WaitOutcome::MailboxActivity,
+                    requested_timeout_ms,
+                    timeout_ms,
+                );
+                let outcomes = outcomes
+                    .iter()
+                    .map(|(thread_id, status)| format!("{thread_id}: {status:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                result
+                    .message
+                    .push_str(&format!("\n\nNative child outcomes: {outcomes}"));
+                ready_result = Some(result);
+            } else {
+                let registered = session
+                    .services
+                    .agent_control
+                    .register_wait_obligation(
+                        session.thread_id,
+                        turn.sub_id.clone(),
+                        target_ids.clone(),
+                    )
+                    .await
+                    .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+                if !registered {
+                    return Err(FunctionCallError::RespondToModel(
+                        "targetful wait could not bind the requested current child turns"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
 
         session
             .emit_turn_item_started(
@@ -91,9 +168,96 @@ impl Handler {
             )
             .await;
 
+        if let Some(result) = ready_result {
+            session
+                .emit_turn_item_completed(
+                    &turn,
+                    TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                        id: call_id,
+                        tool: CollabAgentTool::Wait,
+                        status: CollabAgentToolCallStatus::Completed,
+                        sender_thread_id: session.thread_id,
+                        receiver_thread_ids: Vec::new(),
+                        receiver_agents: Vec::new(),
+                        prompt: None,
+                        model: None,
+                        reasoning_effort: None,
+                        agents_states: HashMap::new(),
+                    }),
+                )
+                .await;
+            return Ok(boxed_tool_output(result));
+        }
+
+        let turn_state = session
+            .input_queue
+            .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+            .await;
+        let (mut activity_rx, pending_activity) = session
+            .input_queue
+            .subscribe_activity(turn_state.as_deref())
+            .await;
+
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
-        let result = WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms);
+        let mut native_outcomes = None;
+        let outcome = if let Some(target_ids) = target_ids {
+            let mut pending_activity = pending_activity;
+            let initial_outcomes = session
+                .services
+                .agent_control
+                .consume_ready_join_obligation_for_targets_with_outcomes(
+                    session.thread_id,
+                    &turn.sub_id,
+                    &target_ids,
+                )
+                .await
+                .unwrap_or(None);
+            if let Some(outcomes) = initial_outcomes {
+                native_outcomes = Some(outcomes);
+                WaitOutcome::MailboxActivity
+            } else {
+                loop {
+                    let outcome =
+                        wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
+                    pending_activity = None;
+                    match outcome {
+                        WaitOutcome::MailboxActivity => {
+                            // Ignore unrelated mailbox activity. A targetful wait
+                            // succeeds only when the exact retained obligation is
+                            // consumed; timeout remains non-terminal.
+                            let outcomes = session
+                                .services
+                                .agent_control
+                                .consume_ready_join_obligation_for_targets_with_outcomes(
+                                    session.thread_id,
+                                    &turn.sub_id,
+                                    &target_ids,
+                                )
+                                .await
+                                .unwrap_or(None);
+                            if let Some(outcomes) = outcomes {
+                                native_outcomes = Some(outcomes);
+                                break WaitOutcome::MailboxActivity;
+                            }
+                        }
+                        WaitOutcome::Steered | WaitOutcome::TimedOut => break outcome,
+                    }
+                }
+            }
+        } else {
+            wait_for_activity(&mut activity_rx, pending_activity, deadline).await
+        };
+        let mut result = WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms);
+        if let Some(outcomes) = native_outcomes {
+            let outcomes = outcomes
+                .iter()
+                .map(|(thread_id, status)| format!("{thread_id}: {status:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            result
+                .message
+                .push_str(&format!("\n\nNative child outcomes: {outcomes}"));
+        }
 
         session
             .emit_turn_item_completed(
@@ -126,6 +290,7 @@ impl CoreToolRuntime for Handler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
+    targets: Option<Vec<String>>,
     timeout_ms: Option<i64>,
 }
 

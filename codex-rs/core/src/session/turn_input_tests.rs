@@ -1,10 +1,12 @@
 use super::*;
+use crate::agent::AgentControl;
 use crate::config::Constrained;
 use crate::session::step_settings::StepSettingsUpdate;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
+use crate::tasks::PendingWakeClaimBarrier;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
 use codex_protocol::AgentPath;
@@ -19,6 +21,9 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
@@ -209,6 +214,337 @@ async fn accepted_input_applies_thread_settings() {
         session.mcp_refresh.is_pending(),
         "server elicitation authority changes must refresh MCP state"
     );
+}
+
+#[tokio::test]
+async fn saturated_v2_direct_start_and_recovery_have_no_side_effects() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    let session_source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .session_source = session_source.clone();
+    session.multi_agent_version = std::sync::OnceLock::from(MultiAgentVersion::V2);
+    session.services.agent_control =
+        AgentControl::default().with_session_id(Default::default(), /*max_threads*/ 1);
+    let held = session
+        .services
+        .agent_control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &session_source)
+        .expect("fixture should hold the only V2 execution permit");
+    let session = Arc::new(session);
+    let settings_before = session.thread_settings_snapshot().await;
+
+    let direct_error = handle(
+        &session,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "must not start".to_string(),
+            text_elements: Vec::new(),
+        }])
+        .with_thread_settings(ThreadSettingsOverrides {
+            approval_policy: Some(AskForApproval::Never),
+            ..Default::default()
+        }),
+        TurnInputMode::StartOrSteer,
+        "direct-saturated".to_string(),
+    )
+    .await
+    .expect_err("saturated direct start must fail before committing settings");
+    assert!(matches!(
+        direct_error.details(),
+        CodexErrorDetails::AgentLimitReached { max_threads: 1 }
+    ));
+    assert_eq!(session.thread_settings_snapshot().await, settings_before);
+    assert!(session.active_turn.lock().await.is_none());
+
+    let recovery_error = handle_recovery(
+        &session,
+        ThreadSettingsOverrides {
+            approval_policy: Some(AskForApproval::Never),
+            ..Default::default()
+        },
+        TurnStartOptions::default(),
+        "recovery-saturated".to_string(),
+    )
+    .await
+    .expect_err("saturated recovery must fail before committing settings");
+    assert!(matches!(
+        recovery_error.details(),
+        CodexErrorDetails::AgentLimitReached { max_threads: 1 }
+    ));
+    assert_eq!(session.thread_settings_snapshot().await, settings_before);
+    assert!(session.active_turn.lock().await.is_none());
+    drop(held);
+}
+
+#[tokio::test]
+async fn user_start_preempts_uncommitted_pending_wake_reservation() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    let session_source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .session_source = session_source.clone();
+    session.multi_agent_version = std::sync::OnceLock::from(MultiAgentVersion::V2);
+    session.services.agent_control =
+        AgentControl::default().with_session_id(Default::default(), /*max_threads*/ 1);
+    let session = Arc::new(session);
+    let pending_mail = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root(),
+        Vec::new(),
+        "pending trigger".to_string(),
+        /*trigger_turn*/ true,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(pending_mail.clone(), Default::default())
+        .await;
+
+    let barrier = PendingWakeClaimBarrier::new();
+    let pending_session = Arc::clone(&session);
+    let pending_barrier = barrier.clone();
+    let pending_wake = tokio::spawn(async move {
+        pending_session
+            .maybe_start_turn_for_pending_work_with_sub_id_and_barrier(
+                "pending-wake".to_string(),
+                pending_barrier,
+            )
+            .await;
+    });
+    barrier.wait_until_claimed().await;
+
+    let submission = start_or_steer_with_task(
+        &session,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "priority user start".to_string(),
+            text_elements: Vec::new(),
+        }]),
+        "priority-user".to_string(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await
+    .expect("the user start must inherit the pending wake's final permit");
+    assert_eq!(
+        submission,
+        TurnInputSubmission::Started {
+            turn_id: "priority-user".to_string(),
+        }
+    );
+
+    barrier.release();
+    pending_wake
+        .await
+        .expect("pending wake should unwind cleanly");
+
+    let turn_state = {
+        let active_turn = session.active_turn.lock().await;
+        let active_turn = active_turn.as_ref().expect("user turn should be active");
+        assert!(active_turn.task.is_some(), "user task should be running");
+        Arc::clone(&active_turn.turn_state)
+    };
+    let saturated = match session
+        .services
+        .agent_control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &session_source)
+    {
+        Ok(_) => panic!("exactly one running task must own the only permit"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        saturated.details(),
+        CodexErrorDetails::AgentLimitReached { max_threads: 1 }
+    ));
+    let pending_input = session
+        .input_queue
+        .take_pending_input_for_turn_state(turn_state.as_ref())
+        .await;
+    assert_eq!(pending_input.len(), 1);
+    assert!(matches!(
+        &pending_input[0],
+        TurnInput::InterAgentCommunication(mail) if mail == &pending_mail
+    ));
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let released = session
+        .services
+        .agent_control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &session_source)
+        .expect("aborting the user task must release the inherited permit");
+    drop(released);
+}
+
+#[tokio::test]
+async fn cancelled_committed_pending_wake_releases_claim_for_user_start() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    let session_source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .session_source = session_source.clone();
+    session.multi_agent_version = std::sync::OnceLock::from(MultiAgentVersion::V2);
+    session.services.agent_control =
+        AgentControl::default().with_session_id(Default::default(), /*max_threads*/ 1);
+    let session = Arc::new(session);
+    let pending_mail = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root(),
+        Vec::new(),
+        "pending cancellation trigger".to_string(),
+        /*trigger_turn*/ true,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(pending_mail.clone(), Default::default())
+        .await;
+
+    let barrier = PendingWakeClaimBarrier::after_commit();
+    let pending_session = Arc::clone(&session);
+    let pending_barrier = barrier.clone();
+    let pending_wake = tokio::spawn(async move {
+        pending_session
+            .maybe_start_turn_for_pending_work_with_sub_id_and_barrier(
+                "cancelled-pending-wake".to_string(),
+                pending_barrier,
+            )
+            .await;
+    });
+    barrier.wait_until_claimed().await;
+    pending_wake.abort();
+    assert!(
+        pending_wake
+            .await
+            .expect_err("the committed pending wake should be cancelled")
+            .is_cancelled()
+    );
+    assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
+
+    let submission = start_or_steer_with_task(
+        &session,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "user after pending cancellation".to_string(),
+            text_elements: Vec::new(),
+        }]),
+        "user-after-pending-cancellation".to_string(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await
+    .expect("cancelled pending wake must not strand the final permit");
+    assert!(matches!(submission, TurnInputSubmission::Started { .. }));
+
+    let turn_state = {
+        let active_turn = session.active_turn.lock().await;
+        let active_turn = active_turn.as_ref().expect("user turn should be active");
+        assert!(active_turn.task.is_some());
+        Arc::clone(&active_turn.turn_state)
+    };
+    let pending_input = session
+        .input_queue
+        .take_pending_input_for_turn_state(turn_state.as_ref())
+        .await;
+    assert_eq!(pending_input.len(), 1);
+    assert!(matches!(
+        &pending_input[0],
+        TurnInput::InterAgentCommunication(mail) if mail == &pending_mail
+    ));
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let released = session
+        .services
+        .agent_control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &session_source)
+        .expect("cancelled pending wake and aborted user task must release the permit");
+    drop(released);
+}
+
+#[tokio::test]
+async fn cancelled_explicit_user_preparation_releases_taskless_claim() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    let session_source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .session_source = session_source.clone();
+    session.multi_agent_version = std::sync::OnceLock::from(MultiAgentVersion::V2);
+    session.services.agent_control =
+        AgentControl::default().with_session_id(Default::default(), /*max_threads*/ 1);
+    let session = Arc::new(session);
+
+    let barrier = UserStartClaimBarrier::new();
+    let cancelled_session = Arc::clone(&session);
+    let cancelled_barrier = barrier.clone();
+    let cancelled_start = tokio::spawn(async move {
+        start_or_steer_with_task_and_barrier(
+            &cancelled_session,
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "cancel during preparation".to_string(),
+                text_elements: Vec::new(),
+            }]),
+            "cancelled-user-preparation".to_string(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+            cancelled_barrier,
+        )
+        .await
+    });
+    barrier.wait_until_claimed().await;
+    cancelled_start.abort();
+    assert!(
+        cancelled_start
+            .await
+            .expect_err("the explicit user preparation should be cancelled")
+            .is_cancelled()
+    );
+
+    let submission = start_or_steer_with_task(
+        &session,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "user after preparation cancellation".to_string(),
+            text_elements: Vec::new(),
+        }]),
+        "user-after-preparation-cancellation".to_string(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await
+    .expect("cancelled preparation must not strand the final permit");
+    assert!(matches!(submission, TurnInputSubmission::Started { .. }));
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some())
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let released = session
+        .services
+        .agent_control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &session_source)
+        .expect("cancelled preparation and aborted user task must release the permit");
+    drop(released);
 }
 
 #[tokio::test]

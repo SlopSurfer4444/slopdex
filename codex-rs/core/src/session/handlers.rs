@@ -119,13 +119,26 @@ pub async fn run_user_shell_command(
         return;
     }
 
+    let reservation = match sess.reserve_execution_capacity_for_turn_start().await {
+        Ok(reservation) => reservation,
+        Err(err) => {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+            })
+            .await;
+            return;
+        }
+    };
+
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
         .await;
-    sess.spawn_task(
+    sess.spawn_task_with_reservation(
         turn_context,
         Vec::new(),
         UserShellCommandTask::new(command, timeout_ms),
+        reservation,
     )
     .await;
 }
@@ -244,11 +257,23 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
 }
 
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
+    let reservation = match sess.reserve_execution_capacity_for_turn_start().await {
+        Ok(reservation) => reservation,
+        Err(err) => {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+            })
+            .await;
+            return;
+        }
+    };
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
         .await;
 
-    sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
+    sess.spawn_task_with_reservation(turn_context, Vec::new(), CompactTask, reservation)
+        .await;
 }
 
 pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32) {

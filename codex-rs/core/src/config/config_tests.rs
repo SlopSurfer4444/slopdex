@@ -11573,7 +11573,7 @@ max_concurrent_threads_per_session = 9
 }
 
 #[tokio::test]
-async fn multi_agent_v2_default_session_thread_cap_counts_root() -> std::io::Result<()> {
+async fn multi_agent_default_caps_are_uniform_128_and_v2_counts_root() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
@@ -11595,10 +11595,47 @@ enabled = true
     assert_eq!(
         (
             config.agent_max_threads,
-            config.effective_agent_max_threads(MultiAgentVersion::V2)
+            config.effective_agent_max_threads(MultiAgentVersion::V1),
+            config.multi_agent_v2.max_concurrent_threads_per_session,
+            config.effective_agent_max_threads(MultiAgentVersion::V2),
+            config.agent_max_depth,
         ),
-        (None, Some(3))
+        (None, Some(128), 128, Some(127), 128)
     );
+
+    for (index, reasoning_effort) in [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+        ReasoningEffort::Ultra,
+        ReasoningEffort::Custom("future-effort".to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut variant = config.clone();
+        variant.model = Some(format!("uniform-cap-model-{index}"));
+        variant.model_reasoning_effort = Some(reasoning_effort);
+        variant.service_tier = Some(if index % 2 == 0 {
+            "default".to_string()
+        } else {
+            "priority".to_string()
+        });
+        assert_eq!(
+            (
+                variant.effective_agent_max_threads(MultiAgentVersion::V1),
+                variant.multi_agent_v2.max_concurrent_threads_per_session,
+                variant.effective_agent_max_threads(MultiAgentVersion::V2),
+                variant.agent_max_depth,
+            ),
+            (Some(128), 128, Some(127), 128),
+            "model, reasoning effort, and service tier must not alter admission caps"
+        );
+    }
 
     Ok(())
 }

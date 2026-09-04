@@ -13,10 +13,14 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
+use crate::state::ActiveTurn;
+use crate::tasks::PendingWakeClaimBarrier;
+use crate::thread_manager::ThreadManagerTestFixture;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
+use crate::tools::handlers::multi_agents_v2::JoinAgentsHandler as JoinAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
@@ -128,10 +132,24 @@ async fn wait_for_recorded_user_input(thread: &crate::CodexThread, expected: &[U
     .expect("timed out waiting for recorded user input");
 }
 
-fn thread_manager() -> ThreadManager {
-    ThreadManager::with_models_provider_for_tests(
+async fn thread_manager() -> ThreadManagerTestFixture {
+    ThreadManager::with_models_provider_and_graph_store_for_tests(
         CodexAuth::from_api_key("dummy"),
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
+    )
+    .await
+}
+
+async fn persistent_thread_manager(config: &crate::config::Config) -> ThreadManager {
+    let state_db = init_state_db(config)
+        .await
+        .expect("sqlite state db should initialize");
+    ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Some(state_db),
     )
 }
 
@@ -288,7 +306,7 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
     }
 
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let mut config = (*turn.config).clone();
     let provider_info =
@@ -334,13 +352,14 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
         .await;
     assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
     assert_eq!(snapshot.model_provider_id, "ollama");
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn spawn_agent_fork_context_rejects_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -368,13 +387,14 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
             "Full-history forked agents inherit the parent agent type; omit agent_type, or spawn without a full-history fork.".to_string(),
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -404,6 +424,7 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
         ))
         .await
         .expect("fork_turns=all should apply agent_type overrides");
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -412,7 +433,7 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
     let mut config = (*turn.config).clone();
     config.model = Some("gpt-5.4-mini".to_string());
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new(config.clone()))
         .await
@@ -428,6 +449,7 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
         config.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -445,7 +467,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         let mut config = (*turn.config).clone();
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         turn.config = Arc::new(config);
-        let manager = thread_manager();
+        let manager = thread_manager().await;
         let root = manager
             .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
@@ -476,6 +498,8 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
             snapshot.service_tier,
             Some(ServiceTier::Fast.request_value().to_string())
         );
+        drop(root);
+        manager.teardown().await;
     }
 
     {
@@ -486,7 +510,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         let mut config = (*turn.config).clone();
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         turn.config = Arc::new(config);
-        let manager = thread_manager();
+        let manager = thread_manager().await;
         let root = manager
             .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
@@ -517,6 +541,8 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
             .await;
 
         assert_eq!(snapshot.service_tier, None);
+        drop(root);
+        manager.teardown().await;
     }
 
     {
@@ -549,7 +575,8 @@ service_tier = "priority"
             },
         );
         turn.config = Arc::new(config);
-        let manager = thread_manager();
+        let manager = thread_manager().await;
+        let fixture_root = manager.codex_home().to_path_buf();
         let root = manager
             .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
@@ -580,6 +607,15 @@ service_tier = "priority"
             .await;
 
         assert_eq!(snapshot.service_tier, None);
+        drop(root);
+        manager.teardown().await;
+        assert!(
+            !tokio::fs::try_exists(&fixture_root)
+                .await
+                .unwrap_or_else(|err| panic!("inspect {}: {err}", fixture_root.display())),
+            "fixture root must stay absent after terminal teardown: {}",
+            fixture_root.display()
+        );
     }
 }
 
@@ -619,7 +655,7 @@ service_tier = "turbo"
         },
     );
     turn.config = Arc::new(config);
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -653,6 +689,7 @@ service_tier = "turbo"
         snapshot.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -669,7 +706,7 @@ async fn spawn_agent_full_history_fork_inherits_root_service_tier() {
     let mut config = (*turn.config).clone();
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     turn.config = Arc::new(config);
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -703,6 +740,7 @@ async fn spawn_agent_full_history_fork_inherits_root_service_tier() {
         snapshot.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -723,7 +761,7 @@ async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -769,13 +807,14 @@ async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
         snapshot.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -826,12 +865,13 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     assert_eq!(snapshot.model, "gpt-5-role-override");
     assert_eq!(snapshot.model_provider_id, parent_provider_id);
     assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn spawn_agent_returns_agent_id_without_task_name() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
 
     let output = SpawnAgentHandler::default()
@@ -853,12 +893,13 @@ async fn spawn_agent_returns_agent_id_without_task_name() {
     assert!(result.get("task_name").is_none());
     assert!(result.get("nickname").is_some());
     assert_eq!(success, Some(true));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_requires_task_name() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -887,12 +928,13 @@ async fn multi_agent_v2_spawn_requires_task_name() {
         panic!("missing task_name should surface as a model-facing error");
     };
     assert!(message.contains("missing field `task_name`"));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -923,6 +965,7 @@ async fn multi_agent_v2_spawn_rejects_legacy_items_field() {
         panic!("legacy items field should surface as a model-facing error");
     };
     assert!(message.contains("unknown field `items`"));
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -952,7 +995,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
     }
 
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1042,12 +1085,13 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
                         && !communication.trigger_turn
             )
     }));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_rejects_legacy_fork_context() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1082,12 +1126,13 @@ async fn multi_agent_v2_spawn_rejects_legacy_fork_context() {
             "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string()
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1122,12 +1167,13 @@ async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
             "fork_turns must be `none`, `all`, or a positive integer string".to_string()
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_rejects_zero_fork_turns() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1162,12 +1208,13 @@ async fn multi_agent_v2_spawn_rejects_zero_fork_turns() {
             "fork_turns must be `none`, `all`, or a positive integer string".to_string()
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -1238,12 +1285,13 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
                         && !communication.trigger_turn
             )
     }));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -1320,12 +1368,13 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
             .iter()
             .any(|op| matches!(op, Op::InterAgentCommunication { .. }))
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_list_agents_returns_completed_status() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1405,12 +1454,13 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .expect("worker agent should be listed");
     assert_eq!(worker.agent_status, json!({"completed": "done"}));
     assert_eq!(success, Some(true));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let mut config = (*turn.config).clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config.clone());
@@ -1489,20 +1539,25 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
 
     assert_eq!(result.agents.len(), 1);
     assert_eq!(result.agents[0].agent_name, worker_path.as_str());
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_list_agents_omits_closed_agents() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let mut config = (*turn.config).clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let manager = persistent_thread_manager(&config).await;
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
-    let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
 
     let session = Arc::new(session);
@@ -1554,7 +1609,7 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
 #[tokio::test]
 async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1621,12 +1676,13 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
     assert_eq!(result.agents.len(), 2);
     assert_eq!(result.agents[0].agent_name, "/root");
     assert_eq!(result.agents[1].agent_name, agent_path.as_str());
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1677,12 +1733,13 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
         panic!("legacy items field should surface as a model-facing error");
     };
     assert!(message.contains("unknown field `items`"));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1751,12 +1808,13 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
                 && communication.encrypted_content.as_deref() == Some("continue")
                 && !communication.trigger_turn
     )));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let mut config = turn.config.as_ref().clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
@@ -1907,12 +1965,13 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
     .expect("parent should receive one completion notification per child turn");
 
     assert_eq!(notifications.len(), 2);
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -1960,12 +2019,13 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
         panic!("legacy items field should surface as a model-facing error");
     };
     assert!(message.contains("unknown field `items`"));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -2037,12 +2097,13 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
         .collect::<Vec<_>>();
 
     assert_eq!(notifications, Vec::<String>::new());
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_omits_agent_id_when_named() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -2076,12 +2137,13 @@ async fn multi_agent_v2_spawn_omits_agent_id_when_named() {
     assert_eq!(result["task_name"], "/root/test_process");
     assert!(result.get("nickname").is_none());
     assert_eq!(success, Some(true));
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -2113,6 +2175,7 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
             "agent_name must use only lowercase letters, digits, and underscores".to_string()
         )
     );
+    manager.teardown().await;
 }
 
 // TODO(anp): Restore this test on Linux once sandbox helpers work inside test microVMs.
@@ -2132,12 +2195,12 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .await
         .expect("sandbox-capable test environment should start");
     let environment_manager = sandbox_runtime.thread_manager.environment_manager();
-    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+    let manager = ThreadManager::with_models_provider_graph_store_and_environment_for_tests(
         CodexAuth::from_api_key("dummy"),
         built_in_model_providers(/*openai_base_url*/ None)["openai"].clone(),
-        turn.config.codex_home.to_path_buf(),
         Arc::clone(&environment_manager),
-    );
+    )
+    .await;
     session.services.agent_control = manager.agent_control();
     let expected_sandbox = turn.config.legacy_sandbox_policy();
     #[allow(deprecated)]
@@ -2258,12 +2321,13 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         child_turn.config.permissions.permission_profile(),
         &expected_permission_profile
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn spawn_agent_rejects_when_depth_limit_exceeded() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
 
     let max_depth = turn.config.agent_max_depth;
@@ -2290,6 +2354,7 @@ async fn spawn_agent_rejects_when_depth_limit_exceeded() {
             "Agent depth limit reached. Solve the task yourself.".to_string()
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -2301,7 +2366,7 @@ async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
     }
 
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
 
     let mut config = (*turn.config).clone();
@@ -2336,6 +2401,7 @@ async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
             .is_some_and(|nickname| !nickname.is_empty())
     );
     assert_eq!(success, Some(true));
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -2347,7 +2413,7 @@ async fn multi_agent_v2_spawn_agent_ignores_configured_max_depth() {
     }
 
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let mut config = (*turn.config).clone();
     config.agent_max_depth = 1;
     config
@@ -2390,6 +2456,7 @@ async fn multi_agent_v2_spawn_agent_ignores_configured_max_depth() {
     assert_eq!(result.task_name, "/root/parent/child");
     assert_eq!(result.nickname, None);
     assert_eq!(success, Some(true));
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -2455,7 +2522,7 @@ async fn send_input_rejects_invalid_id() {
 #[tokio::test]
 async fn send_input_reports_missing_agent() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let agent_id = ThreadId::new();
     let invocation = invocation(
@@ -2471,12 +2538,13 @@ async fn send_input_reports_missing_agent() {
         err,
         FunctionCallError::RespondToModel(format!("agent with id {agent_id} not found"))
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn send_input_interrupts_before_prompt() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
@@ -2520,12 +2588,13 @@ async fn send_input_interrupts_before_prompt() {
         .submit(Op::Shutdown {})
         .await
         .expect("shutdown should submit");
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn send_input_accepts_structured_items() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
@@ -2570,6 +2639,7 @@ async fn send_input_accepts_structured_items() {
         .submit(Op::Shutdown {})
         .await
         .expect("shutdown should submit");
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -2593,7 +2663,7 @@ async fn resume_agent_rejects_invalid_id() {
 #[tokio::test]
 async fn resume_agent_reports_missing_agent() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let agent_id = ThreadId::new();
     let invocation = invocation(
@@ -2609,12 +2679,13 @@ async fn resume_agent_reports_missing_agent() {
         err,
         FunctionCallError::RespondToModel(format!("agent with id {agent_id} not found"))
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn resume_agent_noops_for_active_agent() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
@@ -2648,14 +2719,20 @@ async fn resume_agent_noops_for_active_agent() {
         .submit(Op::Shutdown {})
         .await
         .expect("shutdown should submit");
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
-    let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = turn.config.as_ref().clone();
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let manager = persistent_thread_manager(&config).await;
     session.services.agent_control = manager.agent_control();
-    let config = turn.config.as_ref().clone();
+    set_turn_config(&mut turn, config.clone());
     let thread = manager
         .resume_thread_with_history(
             config.clone(),
@@ -2736,7 +2813,7 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
 #[tokio::test]
 async fn resume_agent_rejects_when_depth_limit_exceeded() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
 
     let max_depth = turn.config.agent_max_depth;
@@ -2763,6 +2840,7 @@ async fn resume_agent_rejects_when_depth_limit_exceeded() {
             "Agent depth limit reached. Solve the task yourself.".to_string()
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -2823,9 +2901,399 @@ async fn wait_agent_rejects_empty_targets() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_join_agents_rejects_empty_targets() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "join_agents",
+        function_payload(json!({"targets": [], "condition": "all"})),
+    );
+
+    let Err(FunctionCallError::RespondToModel(message)) =
+        JoinAgentsHandlerV2.handle(invocation).await
+    else {
+        panic!("empty join targets should be rejected");
+    };
+    assert_eq!(message, "targets must contain at least one direct child");
+}
+
+#[tokio::test]
+async fn multi_agent_v2_join_agents_rejects_duplicate_incarnations() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager().await;
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+
+    let Err(FunctionCallError::RespondToModel(message)) = JoinAgentsHandlerV2
+        .handle(invocation(
+            session,
+            turn,
+            "join_agents",
+            function_payload(json!({
+                "targets": [agent_id.to_string(), agent_id.to_string()],
+                "condition": "all"
+            })),
+        ))
+        .await
+    else {
+        panic!("duplicate join targets should be rejected");
+    };
+    assert_eq!(
+        message,
+        format!("target `{agent_id}` resolves to a duplicate child")
+    );
+    manager.teardown().await;
+}
+
+#[tokio::test]
+async fn multi_agent_v2_join_agents_registers_observer_after_handler_cancellation() {
+    let (_fixture_session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let manager = thread_manager().await;
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    let session = Arc::clone(&root.thread.session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+    let mut status_rx = session
+        .services
+        .agent_control
+        .subscribe_status(agent_id)
+        .await
+        .expect("worker status should be readable");
+    while matches!(*status_rx.borrow(), AgentStatus::PendingInit) {
+        status_rx
+            .changed()
+            .await
+            .expect("worker status should advance");
+    }
+
+    let join_invocation = invocation(
+        session.clone(),
+        turn.clone(),
+        "join_agents",
+        function_payload(json!({
+            "targets": [agent_id.to_string()],
+            "condition": "all"
+        })),
+    );
+    join_invocation.cancellation_token.cancel();
+    let output = JoinAgentsHandlerV2
+        .handle(join_invocation)
+        .await
+        .expect("handler cancellation must not cancel registration");
+    let (text, success) = expect_text_output(output);
+    assert_eq!(success, Some(true));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).expect("join output should be JSON")["suspended"],
+        false
+    );
+
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("registered child should remain addressable");
+    {
+        let mut active_turn = session.active_turn.lock().await;
+        assert!(
+            active_turn.is_none(),
+            "test parent should be idle before fencing it"
+        );
+        *active_turn = Some(ActiveTurn::default());
+    }
+    child_thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("terminal child shutdown should submit");
+    let (mut activity_rx, pending_activity) = session
+        .clone()
+        .input_queue
+        .subscribe_activity(/*turn_state*/ None)
+        .await;
+    if pending_activity.is_none() {
+        activity_rx
+            .changed()
+            .await
+            .expect("observer should notify the parent queue");
+    }
+    assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
+    {
+        let mut active_turn = session.active_turn.lock().await;
+        let active = active_turn
+            .as_ref()
+            .expect("synthetic parent boundary should remain until mail is observed");
+        assert!(active.task.is_none());
+        *active_turn = None;
+    }
+    let barrier = PendingWakeClaimBarrier::after_commit();
+    let pending_session = Arc::clone(&session);
+    let pending_barrier = barrier.clone();
+    let pending_wake = tokio::spawn(async move {
+        pending_session
+            .maybe_start_turn_for_pending_work_with_sub_id_and_barrier(
+                "join-pending-wake".to_string(),
+                pending_barrier,
+            )
+            .await;
+    });
+    barrier.wait_until_claimed().await;
+    {
+        let active_turn = session.active_turn.lock().await;
+        let active_turn = active_turn
+            .as_ref()
+            .expect("pending join wake should claim the idle parent");
+        assert!(
+            active_turn.task.is_none(),
+            "the normal pending path must not start before the commit barrier is released"
+        );
+    }
+    barrier.release();
+    pending_wake
+        .await
+        .expect("normal pending join wake should complete");
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+    assert!(!session
+        .services
+        .agent_control
+        .consume_ready_join_obligation_for_targets(
+            session.thread_id,
+            &turn.sub_id,
+            &[agent_id],
+        )
+        .await
+        .expect("normal pending path should consume the exact join obligation"));
+    manager.teardown().await;
+}
+
+#[tokio::test]
+async fn multi_agent_v2_join_observer_distinguishes_interrupted_and_shutdown() {
+    for interrupt_first in [true, false] {
+        let (_fixture_session, mut turn) = make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        set_turn_config(&mut turn, config);
+        let manager = thread_manager().await;
+        let root = manager
+            .start_thread(StartThreadOptions::new((*turn.config).clone()))
+            .await
+            .expect("root thread should start");
+        let session = Arc::clone(&root.thread.session);
+        let turn = Arc::new(turn);
+
+        SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "spawn_agent",
+                function_payload(json!({
+                    "message": "stay live until the disposition oracle stops this turn",
+                    "task_name": "worker"
+                })),
+            ))
+            .await
+            .expect("spawn worker");
+        let agent_id = session
+            .services
+            .agent_control
+            .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+            .await
+            .expect("worker should resolve");
+        let child_path = AgentPath::try_from("/root/worker").expect("worker path");
+        let child_thread = manager
+            .get_thread(agent_id)
+            .await
+            .expect("registered child should remain addressable");
+        let mut status_rx = session
+            .services
+            .agent_control
+            .subscribe_status(agent_id)
+            .await
+            .expect("worker status should be readable");
+        timeout(Duration::from_secs(5), async {
+            while matches!(*status_rx.borrow(), AgentStatus::PendingInit) {
+                status_rx
+                    .changed()
+                    .await
+                    .expect("worker status should advance");
+            }
+        })
+        .await
+        .expect("worker should leave PendingInit");
+
+        JoinAgentsHandlerV2
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "join_agents",
+                function_payload(json!({
+                    "targets": [agent_id.to_string()],
+                    "condition": "all"
+                })),
+            ))
+            .await
+            .expect("join registration should succeed");
+
+        if interrupt_first {
+            child_thread
+                .submit(Op::Interrupt)
+                .await
+                .expect("interrupt should submit");
+            timeout(Duration::from_secs(5), async {
+                while *status_rx.borrow() != AgentStatus::Interrupted {
+                    status_rx
+                        .changed()
+                        .await
+                        .expect("worker status should reach Interrupted");
+                }
+            })
+            .await
+            .expect("worker should become resumably interrupted");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let interrupted_wakes = manager
+                .captured_ops()
+                .into_iter()
+                .filter(|(thread_id, op)| {
+                    *thread_id == root.thread_id
+                        && matches!(
+                            op,
+                            Op::InterAgentCommunication { communication, .. }
+                                if communication.trigger_turn
+                                    && communication.author == child_path
+                                    && communication.recipient == AgentPath::root()
+                        )
+                })
+                .count();
+            assert_eq!(
+                interrupted_wakes, 0,
+                "Interrupted is resumable and must not discharge the exact join"
+            );
+        }
+
+        child_thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+        timeout(Duration::from_secs(5), async {
+            while *status_rx.borrow() != AgentStatus::Shutdown {
+                status_rx
+                    .changed()
+                    .await
+                    .expect("worker status should reach Shutdown");
+            }
+        })
+        .await
+        .expect("worker should emit ShutdownComplete");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let shutdown_wakes = manager
+                    .captured_ops()
+                    .into_iter()
+                    .filter(|(thread_id, op)| {
+                        *thread_id == root.thread_id
+                            && matches!(
+                                op,
+                                Op::InterAgentCommunication { communication, .. }
+                                    if communication.trigger_turn
+                                        && communication.author == child_path
+                                        && communication.recipient == AgentPath::root()
+                            )
+                    })
+                    .count();
+                if shutdown_wakes == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Shutdown should author exactly one parent continuation");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let final_wakes = manager
+            .captured_ops()
+            .into_iter()
+            .filter(|(thread_id, op)| {
+                *thread_id == root.thread_id
+                    && matches!(
+                        op,
+                        Op::InterAgentCommunication { communication, .. }
+                            if communication.trigger_turn
+                                && communication.author == child_path
+                                && communication.recipient == AgentPath::root()
+                    )
+            })
+            .count();
+        assert_eq!(
+            final_wakes, 1,
+            "Shutdown must not duplicate the parent wake"
+        );
+        manager.teardown().await;
+    }
+}
+
+#[tokio::test]
 async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -2912,6 +3380,137 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
         }
     );
     assert_eq!(success, None);
+    manager.teardown().await;
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_timeout_then_same_turn_retry_consumes_terminal_child() {
+    let (_fixture_session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config.multi_agent_v2.min_wait_timeout_ms = 1;
+    config.multi_agent_v2.max_wait_timeout_ms = 1_000;
+    config.multi_agent_v2.default_wait_timeout_ms = 1;
+    set_turn_config(&mut turn, config);
+    let manager = thread_manager().await;
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    let session = Arc::clone(&root.thread.session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+    let mut status_rx = session
+        .services
+        .agent_control
+        .subscribe_status(agent_id)
+        .await
+        .expect("worker status should be readable");
+    while matches!(*status_rx.borrow(), AgentStatus::PendingInit) {
+        timeout(Duration::from_secs(5), status_rx.changed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "B34 wait worker did not leave PendingInit: child_status={:?}",
+                    *status_rx.borrow()
+                )
+            })
+            .expect("worker status should advance");
+    }
+
+    let timeout_output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [agent_id.to_string()],
+                "timeout_ms": 1
+            })),
+        ))
+        .await
+        .expect("targetful wait should time out without discharging ownership");
+    let (timeout_text, timeout_success) = expect_text_output(timeout_output);
+    let timeout_result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&timeout_text).expect("timeout result should be json");
+    assert!(timeout_result.timed_out);
+    assert_eq!(timeout_success, None);
+
+    let (mut activity_rx, pending_activity) = session
+        .input_queue
+        .subscribe_activity(/*turn_state*/ None)
+        .await;
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("registered child should remain addressable");
+    child_thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("terminal child shutdown should submit");
+    if pending_activity.is_none() {
+        let child_status = child_thread.agent_status().await;
+        let pending_mailbox = session.input_queue.has_pending_mailbox_items().await;
+        let trigger_mailbox = session.input_queue.has_trigger_turn_mailbox_items().await;
+        timeout(Duration::from_secs(5), activity_rx.changed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "B34 wait observer notification absent: child_status={child_status:?} pending_activity={pending_activity:?} pending_mailbox={pending_mailbox} trigger_mailbox={trigger_mailbox} retained_wait_ready={}",
+                    pending_activity.is_some()
+                )
+            })
+            .expect("terminal child should notify the retained wait");
+    }
+
+    let retry_output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": [agent_id.to_string()],
+                "timeout_ms": 1_000
+            })),
+        ))
+        .await
+        .expect("same-turn retry should consume the retained terminal result");
+    let (retry_text, retry_success) = expect_text_output(retry_output);
+    let retry_result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&retry_text).expect("retry result should be json");
+    assert!(!retry_result.timed_out);
+    assert_eq!(retry_success, None);
+    assert_eq!(
+        retry_result
+            .message
+            .matches("Native child outcomes:")
+            .count(),
+        1,
+        "the retained terminal result must be consumed exactly once"
+    );
+    assert!(retry_result.message.contains("Shutdown"));
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -3159,7 +3758,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
 #[tokio::test]
 async fn wait_agent_returns_not_found_for_missing_agents() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let id_a = ThreadId::new();
     let id_b = ThreadId::new();
@@ -3190,12 +3789,14 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
         }
     );
     assert_eq!(success, None);
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn wait_agent_times_out_when_status_is_not_final() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
+    let fixture_root = manager.codex_home().to_path_buf();
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
@@ -3233,12 +3834,21 @@ async fn wait_agent_times_out_when_status_is_not_final() {
         .submit(Op::Shutdown {})
         .await
         .expect("shutdown should submit");
+    drop(thread);
+    manager.teardown().await;
+    assert!(
+        !tokio::fs::try_exists(&fixture_root)
+            .await
+            .unwrap_or_else(|err| panic!("inspect {}: {err}", fixture_root.display())),
+        "fixture root must stay absent after terminal teardown: {}",
+        fixture_root.display()
+    );
 }
 
 #[tokio::test]
 async fn wait_agent_clamps_short_timeouts_to_minimum() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
@@ -3271,12 +3881,13 @@ async fn wait_agent_clamps_short_timeouts_to_minimum() {
         .submit(Op::Shutdown {})
         .await
         .expect("shutdown should submit");
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn wait_agent_returns_final_status_without_timeout() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
@@ -3323,12 +3934,13 @@ async fn wait_agent_returns_final_status_without_timeout() {
         }
     );
     assert_eq!(success, None);
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -3416,12 +4028,13 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
         }
     );
     assert_eq!(success, None);
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -3500,12 +4113,13 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
         }
     );
     assert_eq!(success, None);
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -3594,12 +4208,13 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
         }
     );
     assert_eq!(success, None);
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -3686,12 +4301,13 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     );
     assert!(!content.contains("sensitive child output"));
     assert_eq!(success, None);
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -3793,6 +4409,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
         !ops.iter()
             .any(|(thread_id, op)| *thread_id == child_id && matches!(op, Op::Interrupt))
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -3908,7 +4525,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_rejects_root_target_and_id() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
@@ -3953,12 +4570,13 @@ async fn multi_agent_v2_interrupt_agent_rejects_root_target_and_id() {
         root_id_error,
         FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_id() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -4020,12 +4638,13 @@ async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_id() {
                 .to_string()
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -4087,12 +4706,13 @@ async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name() {
                 .to_string()
         )
     );
+    manager.teardown().await;
 }
 
 #[tokio::test]
 async fn close_agent_submits_shutdown_and_returns_previous_status() {
     let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
+    let manager = thread_manager().await;
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
@@ -4126,6 +4746,7 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 
     let status_after = manager.agent_control().get_status(agent_id).await;
     assert_eq!(status_after, AgentStatus::NotFound);
+    manager.teardown().await;
 }
 
 #[tokio::test]
@@ -4462,6 +5083,9 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .expect("approval policy set");
     assert_eq!(config, expected);
 }
+
+#[path = "multi_agents/wait_join_regression_tests.rs"]
+mod wait_join_regression_tests;
 
 #[tokio::test]
 async fn build_agent_resume_config_clears_base_instructions() {

@@ -94,6 +94,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tracing::instrument;
@@ -113,6 +114,18 @@ static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
 type CapturedOps = Vec<(ThreadId, Op)>;
 type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
 pub(crate) type ThreadIdGenerator = Arc<dyn Fn() -> ThreadId + Send + Sync>;
+
+mod spawn_edge_lifecycle;
+#[cfg(test)]
+mod sqlite_test_fixture;
+
+#[cfg(test)]
+pub(crate) use spawn_edge_lifecycle::CloseAfterDurableEdgeTestProbe;
+#[cfg(test)]
+pub(crate) use spawn_edge_lifecycle::LifecycleCommitTestHook;
+use spawn_edge_lifecycle::ThreadIncarnations;
+#[cfg(test)]
+pub(crate) use sqlite_test_fixture::ThreadManagerTestFixture;
 
 // `Op` is intentionally not `Clone`. Thread-manager tests only snapshot the
 // small subset of ops they inspect.
@@ -342,6 +355,25 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    /// Serializes registration and generation-checked cleanup for thread IDs.
+    ///
+    /// The durable edge close is performed while this fence is held, so a
+    /// replacement runtime cannot be registered between the identity check,
+    /// edge close, and map removal.
+    thread_registration_fence: Arc<AsyncMutex<()>>,
+    thread_incarnations: Arc<AsyncMutex<ThreadIncarnations>>,
+    #[cfg(test)]
+    shutdown_all_threads_hook:
+        Arc<AsyncMutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    pub(crate) close_before_lifecycle_commit_hook: LifecycleCommitTestHook,
+    #[cfg(test)]
+    pub(crate) close_after_durable_edge_probe:
+        Arc<AsyncMutex<Option<Arc<CloseAfterDurableEdgeTestProbe>>>>,
+    #[cfg(test)]
+    pub(crate) registration_before_lifecycle_commit_hook: LifecycleCommitTestHook,
+    #[cfg(test)]
+    pub(crate) duplicate_before_shutdown_hook: LifecycleCommitTestHook,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
@@ -471,6 +503,18 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_registration_fence: Arc::new(AsyncMutex::new(())),
+                thread_incarnations: Arc::new(AsyncMutex::new(ThreadIncarnations::default())),
+                #[cfg(test)]
+                shutdown_all_threads_hook: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                close_before_lifecycle_commit_hook: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                close_after_durable_edge_probe: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                registration_before_lifecycle_commit_hook: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                duplicate_before_shutdown_hook: Arc::new(AsyncMutex::new(None)),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
@@ -583,6 +627,24 @@ impl ThreadManager {
         environment_manager: Arc<EnvironmentManager>,
         state_db: Option<StateDbHandle>,
     ) -> Self {
+        Self::with_models_provider_home_state_and_bundled_skills_for_tests(
+            auth,
+            provider,
+            codex_home,
+            environment_manager,
+            state_db,
+            /*bundled_skills_enabled*/ true,
+        )
+    }
+
+    fn with_models_provider_home_state_and_bundled_skills_for_tests(
+        auth: CodexAuth,
+        provider: ModelProviderInfo,
+        codex_home: PathBuf,
+        environment_manager: Arc<EnvironmentManager>,
+        state_db: Option<StateDbHandle>,
+        bundled_skills_enabled: bool,
+    ) -> Self {
         set_thread_manager_test_mode_for_tests(/*enabled*/ true);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
         let installation_id = uuid::Uuid::new_v4().to_string();
@@ -594,7 +656,7 @@ impl ThreadManager {
         let restriction_product = SessionSource::Exec.restriction_product();
         let skills_service = Arc::new(HostSkillsService::new_with_restriction_product(
             absolute_codex_home.clone(),
-            /*bundled_skills_enabled*/ true,
+            bundled_skills_enabled,
             restriction_product,
         ));
         let plugins_manager = Arc::new(PluginsManager::new_with_options(
@@ -618,6 +680,18 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_registration_fence: Arc::new(AsyncMutex::new(())),
+                thread_incarnations: Arc::new(AsyncMutex::new(ThreadIncarnations::default())),
+                #[cfg(test)]
+                shutdown_all_threads_hook: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                close_before_lifecycle_commit_hook: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                close_after_durable_edge_probe: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                registration_before_lifecycle_commit_hook: Arc::new(AsyncMutex::new(None)),
+                #[cfg(test)]
+                duplicate_before_shutdown_hook: Arc::new(AsyncMutex::new(None)),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
@@ -1163,10 +1237,14 @@ impl ThreadManager {
     /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
     /// Returns the thread if the thread was found and removed.
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.state.threads.write().await.remove(thread_id)
+        let expected = self.state.threads.read().await.get(thread_id).cloned()?;
+        self.state
+            .remove_runtime_if_matches(*thread_id, &expected)
+            .await
     }
 
-    /// Removes a thread only if `thread_id` still maps to `expected`.
+    /// Removes the exact in-memory runtime only if `thread_id` still maps to
+    /// `expected`; its durable spawn edge remains intact.
     ///
     /// Delayed cleanup uses this to avoid removing a replacement runtime registered under the
     /// same thread ID.
@@ -1175,15 +1253,9 @@ impl ThreadManager {
         thread_id: &ThreadId,
         expected: &Arc<CodexThread>,
     ) -> Option<Arc<CodexThread>> {
-        let mut threads = self.state.threads.write().await;
-        if threads
-            .get(thread_id)
-            .is_some_and(|thread| Arc::ptr_eq(thread, expected))
-        {
-            threads.remove(thread_id)
-        } else {
-            None
-        }
+        self.state
+            .remove_runtime_if_matches(*thread_id, expected)
+            .await
     }
 
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
@@ -1199,15 +1271,19 @@ impl ThreadManager {
         };
 
         let mut shutdowns = threads
-            .into_iter()
-            .map(|(thread_id, thread)| async move {
-                let outcome = match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await
-                {
-                    Ok(Ok(())) => ShutdownOutcome::Complete,
-                    Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
-                    Err(_) => ShutdownOutcome::TimedOut,
-                };
-                (thread_id, outcome)
+            .iter()
+            .map(|(thread_id, thread)| {
+                let thread_id = *thread_id;
+                let thread = Arc::clone(thread);
+                async move {
+                    let outcome =
+                        match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await {
+                            Ok(Ok(())) => ShutdownOutcome::Complete,
+                            Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
+                            Err(_) => ShutdownOutcome::TimedOut,
+                        };
+                    (thread_id, outcome)
+                }
             })
             .collect::<FuturesUnordered<_>>();
         let mut report = ThreadShutdownReport::default();
@@ -1220,9 +1296,38 @@ impl ThreadManager {
             }
         }
 
-        let mut tracked_threads = self.state.threads.write().await;
-        for thread_id in &report.completed {
-            tracked_threads.remove(thread_id);
+        #[cfg(test)]
+        if let Some((snapshot_ready, resume_cleanup)) =
+            self.state.shutdown_all_threads_hook.lock().await.clone()
+        {
+            snapshot_ready.wait().await;
+            resume_cleanup.notified().await;
+        }
+
+        for thread_id in report.completed.clone() {
+            let Some(thread) = threads
+                .iter()
+                .find(|(candidate_id, _)| *candidate_id == thread_id)
+                .map(|(_, thread)| Arc::clone(thread))
+            else {
+                continue;
+            };
+            match self
+                .state
+                .remove_runtime_if_matches(thread_id, &thread)
+                .await
+            {
+                Some(_) => {}
+                None => {
+                    warn!(
+                        "bounded shutdown completed for {thread_id}, but exact runtime removal was not proven"
+                    );
+                    report
+                        .completed
+                        .retain(|completed_id| *completed_id != thread_id);
+                    report.submit_failed.push(thread_id);
+                }
+            }
         }
 
         report
@@ -1543,11 +1648,6 @@ impl ThreadManagerState {
             .io
             .submit_with_trace(op, /*trace*/ None, parent_turn_id, root_turn_id)
             .await
-    }
-
-    /// Remove a thread from the manager by ID, returning it when present.
-    pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.threads.write().await.remove(thread_id)
     }
 
     pub(crate) async fn effective_multi_agent_version_for_spawn(
@@ -1882,6 +1982,16 @@ impl ThreadManagerState {
             reserved_thread_id,
         } = options;
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
+        if !config.ephemeral
+            && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) = &session_source
+            && self.agent_graph_store.is_none()
+        {
+            return Err(CodexErr::Fatal(format!(
+                "cannot spawn durable thread-spawn child for parent {parent_thread_id}: graph store unavailable"
+            )));
+        }
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(
                 self.environment_manager.as_ref(),
@@ -2065,7 +2175,8 @@ impl ThreadManagerState {
             }
         };
 
-        {
+        let registration_fence = self.thread_registration_fence.lock().await;
+        let duplicate = {
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
                 let thread = Arc::new(CodexThread::new(
@@ -2075,6 +2186,7 @@ impl ThreadManagerState {
                     session_configured.rollout_path.clone(),
                     session_source,
                 ));
+                self.record_thread_incarnation(thread_id, &thread).await;
                 e.insert(thread.clone());
                 return Ok(NewThread {
                     thread_id,
@@ -2082,8 +2194,19 @@ impl ThreadManagerState {
                     session_configured,
                 });
             }
-        }
+            true
+        };
+        debug_assert!(duplicate);
+        drop(registration_fence);
 
+        #[cfg(test)]
+        if let Some((target, entered, release)) =
+            self.duplicate_before_shutdown_hook.lock().await.clone()
+            && target == thread_id
+        {
+            entered.wait().await;
+            release.notified().await;
+        }
         if let Err(err) = io.shutdown_and_wait().await {
             warn!("failed to shut down duplicate thread {thread_id}: {err}");
         }

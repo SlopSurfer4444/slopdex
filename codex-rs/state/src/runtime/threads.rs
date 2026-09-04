@@ -5,6 +5,25 @@ use codex_protocol::protocol::SessionSource;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
+async fn thread_spawn_edge_by_child_on_connection(
+    connection: &mut SqliteConnection,
+    child_thread_id: ThreadId,
+) -> anyhow::Result<Option<(ThreadId, crate::DirectionalThreadSpawnEdgeStatus)>> {
+    let row = sqlx::query(
+        "SELECT parent_thread_id, status FROM thread_spawn_edges WHERE child_thread_id = ?",
+    )
+    .bind(child_thread_id.to_string())
+    .fetch_optional(connection)
+    .await?;
+    row.map(|row| {
+        Ok((
+            ThreadId::from_string(&row.try_get::<String, _>("parent_thread_id")?)?,
+            row.try_get::<String, _>("status")?.parse()?,
+        ))
+    })
+    .transpose()
+}
+
 impl StateRuntime {
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
         let row = sqlx::query(
@@ -127,6 +146,7 @@ WHERE id = ? AND preview = ''
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
+        let _edge_fence = self.acquire_thread_spawn_edge_fence().await;
         sqlx::query(
             r#"
 INSERT INTO thread_spawn_edges (
@@ -153,12 +173,59 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
+        let _edge_fence = self.acquire_thread_spawn_edge_fence().await;
         sqlx::query("UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?")
             .bind(status.as_ref())
             .bind(child_thread_id.to_string())
             .execute(self.pool.as_ref())
             .await?;
         Ok(())
+    }
+
+    /// Closes one exact Open spawn edge, preserving its completion work if the caller is cancelled.
+    pub async fn close_open_thread_spawn_edge(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> anyhow::Result<crate::ThreadSpawnEdgeCloseOutcome> {
+        let edge_fence = Arc::clone(&self.thread_spawn_edge_fence);
+        let pool = Arc::clone(&self.pool);
+        tokio::spawn(async move {
+            let _edge_fence = edge_fence.lock_owned().await;
+            let mut connection: sqlx::pool::PoolConnection<Sqlite> = pool.acquire().await?;
+            let result = sqlx::query(
+                r#"
+UPDATE thread_spawn_edges
+SET status = 'closed'
+WHERE parent_thread_id = ? AND child_thread_id = ? AND status = 'open'
+                "#,
+            )
+            .bind(parent_thread_id.to_string())
+            .bind(child_thread_id.to_string())
+            .execute(&mut *connection)
+            .await?;
+            if result.rows_affected() > 0 {
+                return Ok(crate::ThreadSpawnEdgeCloseOutcome::NewlyClosed);
+            }
+
+            Ok(
+                match thread_spawn_edge_by_child_on_connection(&mut connection, child_thread_id)
+                    .await?
+                {
+                    Some((
+                        actual_parent_thread_id,
+                        crate::DirectionalThreadSpawnEdgeStatus::Closed,
+                    )) if actual_parent_thread_id == parent_thread_id => {
+                        crate::ThreadSpawnEdgeCloseOutcome::AlreadyExactClosed
+                    }
+                    _ => crate::ThreadSpawnEdgeCloseOutcome::MismatchOrMissing,
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            anyhow::Error::from(error).context("thread spawn edge close task failed")
+        })?
     }
 
     /// List direct spawned children of `parent_thread_id` whose edge matches `status`.
@@ -340,6 +407,7 @@ ORDER BY depth ASC, child_thread_id ASC
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
     ) -> anyhow::Result<()> {
+        let _edge_fence = self.acquire_thread_spawn_edge_fence().await;
         sqlx::query(
             r#"
 INSERT INTO thread_spawn_edges (
@@ -1118,6 +1186,7 @@ ON CONFLICT(id) DO UPDATE SET
         if thread_ids.is_empty() {
             return Ok(0);
         }
+        let _edge_fence = self.acquire_thread_spawn_edge_fence().await;
 
         let thread_id_strings = thread_ids
             .iter()

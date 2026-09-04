@@ -144,15 +144,22 @@ impl V2Residency {
                 self.touch(candidate_thread_id);
                 continue;
             }
-            let environments = candidate_thread.environment_selections().await;
-            candidate_thread
-                .session
-                .services
-                .agent_control
-                .state
-                .save_evicted_environments(candidate_thread_id, environments);
-            let _ = manager.remove_thread(&candidate_thread_id).await;
-            return true;
+            match manager
+                .remove_runtime_if_matches(candidate_thread_id, &candidate_thread)
+                .await
+            {
+                Some(_) => {
+                    let environments = candidate_thread.environment_selections().await;
+                    candidate_thread
+                        .session
+                        .services
+                        .agent_control
+                        .state
+                        .save_evicted_environments(candidate_thread_id, environments);
+                    return true;
+                }
+                None => return true,
+            }
         }
         false
     }
@@ -236,6 +243,7 @@ async fn is_unloadable(thread: &CodexThread) -> bool {
         AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
     ) && thread.session.active_turn.lock().await.is_none()
         && !thread.session.input_queue.has_pending_mailbox_items().await
+        && !thread.session.input_queue.has_owned_join_state().await
 }
 
 #[cfg(test)]

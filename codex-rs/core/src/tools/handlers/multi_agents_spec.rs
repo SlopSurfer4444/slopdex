@@ -289,6 +289,39 @@ pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     })
 }
 
+pub fn create_join_agents_tool_v2() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "targets".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some("Direct child agents whose current work must finish.".to_string()),
+            ),
+        ),
+        (
+            "condition".to_string(),
+            JsonSchema::string_enum(
+                vec![serde_json::json!("all")],
+                Some("Resume after all listed direct children finish.".to_string()),
+            ),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "join_agents".to_string(),
+        description: "Suspend this parent after the current response step and resume it exactly once when all listed direct children finish. Use this instead of polling when later work depends on every child result."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["targets".to_string(), "condition".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    })
+}
+
 pub fn create_list_agents_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "path_prefix".to_string(),

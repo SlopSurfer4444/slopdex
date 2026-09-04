@@ -3813,6 +3813,15 @@ impl Session {
         self.multi_agent_version.get().copied()
     }
 
+    pub(crate) async fn execution_reservation_session_source(&self) -> SessionSource {
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .session_source
+            .clone()
+    }
+
     pub(crate) fn set_multi_agent_version_if_unset(
         &self,
         multi_agent_version: MultiAgentVersion,

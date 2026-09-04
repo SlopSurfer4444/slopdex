@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::AgentGraphStore;
 use crate::AgentGraphStoreError;
 use crate::AgentGraphStoreFuture;
+use crate::ThreadSpawnEdgeCloseOutcome;
 use crate::ThreadSpawnEdgeStatus;
 
 /// SQLite-backed implementation of [`AgentGraphStore`] using an existing state runtime.
@@ -57,6 +58,31 @@ impl AgentGraphStore for LocalAgentGraphStore {
                 .set_thread_spawn_edge_status(child_thread_id, to_state_status(status))
                 .await
                 .map_err(internal_error)
+        })
+    }
+
+    fn close_open_thread_spawn_edge(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> AgentGraphStoreFuture<'_, ThreadSpawnEdgeCloseOutcome> {
+        Box::pin(async move {
+            match self
+                .state_db
+                .close_open_thread_spawn_edge(parent_thread_id, child_thread_id)
+                .await
+                .map_err(internal_error)?
+            {
+                codex_state::ThreadSpawnEdgeCloseOutcome::NewlyClosed => {
+                    Ok(ThreadSpawnEdgeCloseOutcome::NewlyClosed)
+                }
+                codex_state::ThreadSpawnEdgeCloseOutcome::AlreadyExactClosed => {
+                    Ok(ThreadSpawnEdgeCloseOutcome::AlreadyExactClosed)
+                }
+                codex_state::ThreadSpawnEdgeCloseOutcome::MismatchOrMissing => {
+                    Ok(ThreadSpawnEdgeCloseOutcome::MismatchOrMissing)
+                }
+            }
         })
     }
 
@@ -242,6 +268,46 @@ mod tests {
             .await
             .expect("closed children should load");
         assert_eq!(closed_children, vec![child_thread_id]);
+    }
+
+    #[tokio::test]
+    async fn local_store_close_open_thread_spawn_edge_preserves_three_way_outcome() {
+        let fixture = state_runtime().await;
+        let store = LocalAgentGraphStore::new(fixture.state_db);
+        let parent_thread_id = thread_id(/*suffix*/ 12);
+        let other_parent_thread_id = thread_id(/*suffix*/ 13);
+        let child_thread_id = thread_id(/*suffix*/ 14);
+
+        store
+            .upsert_thread_spawn_edge(
+                parent_thread_id,
+                child_thread_id,
+                ThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("Open child edge should insert");
+
+        let mismatch_or_missing = store
+            .close_open_thread_spawn_edge(other_parent_thread_id, child_thread_id)
+            .await
+            .expect("missing exact Open edge should remain negative");
+        let newly_closed = store
+            .close_open_thread_spawn_edge(parent_thread_id, child_thread_id)
+            .await
+            .expect("exact Open edge should close");
+        let already_exact_closed = store
+            .close_open_thread_spawn_edge(parent_thread_id, child_thread_id)
+            .await
+            .expect("exact already Closed edge should be confirmed");
+
+        assert_eq!(
+            (newly_closed, already_exact_closed, mismatch_or_missing),
+            (
+                ThreadSpawnEdgeCloseOutcome::NewlyClosed,
+                ThreadSpawnEdgeCloseOutcome::AlreadyExactClosed,
+                ThreadSpawnEdgeCloseOutcome::MismatchOrMissing,
+            )
+        );
     }
 
     #[tokio::test]

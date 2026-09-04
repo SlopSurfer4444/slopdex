@@ -12,6 +12,10 @@ use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use codex_agent_graph_store::AgentGraphStore as GraphStore;
+use codex_agent_graph_store::AgentGraphStoreError as Error;
+use codex_agent_graph_store::AgentGraphStoreFuture as Fut;
+use codex_agent_graph_store::ThreadSpawnEdgeStatus as EdgeStatus;
 use codex_extension_api::empty_extension_registry;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
@@ -48,6 +52,8 @@ use core_test_support::responses::strip_response_item_ids_from_json;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tempfile::tempdir;
+use tokio::sync::Barrier;
+use tokio::sync::Notify;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -319,6 +325,19 @@ impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
         _status: codex_agent_graph_store::ThreadSpawnEdgeStatus,
     ) -> codex_agent_graph_store::AgentGraphStoreFuture<'_, ()> {
         Box::pin(async { panic!("unexpected graph status update") })
+    }
+
+    fn close_open_thread_spawn_edge(
+        &self,
+        _parent_thread_id: ThreadId,
+        _child_thread_id: ThreadId,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<
+        '_,
+        codex_agent_graph_store::ThreadSpawnEdgeCloseOutcome,
+    > {
+        Box::pin(async {
+            Ok(codex_agent_graph_store::ThreadSpawnEdgeCloseOutcome::MismatchOrMissing)
+        })
     }
 
     fn list_thread_spawn_children(
@@ -2746,7 +2765,7 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         .await
         .expect("read source rollout history");
     assert!(snapshot_turn_state(&source_history).ends_mid_turn);
-    manager.remove_thread(&source.thread_id).await;
+    assert!(manager.remove_thread(&source.thread_id).await.is_some());
 
     let forked = manager
         .fork_thread(
@@ -2788,7 +2807,7 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         1,
     );
 
-    manager.remove_thread(&forked.thread_id).await;
+    assert!(manager.remove_thread(&forked.thread_id).await.is_some());
     let reforked = manager
         .fork_thread(
             ForkSnapshot::Interrupted,
@@ -2839,3 +2858,8 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         1,
     );
 }
+
+#[path = "thread_manager/durable_spawn_edge_tests.rs"]
+mod durable_spawn_edge_tests;
+#[path = "thread_manager/spawn_edge_lifecycle_tests.rs"]
+mod spawn_edge_lifecycle_tests;

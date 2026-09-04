@@ -423,6 +423,36 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
 }
 
 #[test]
+fn join_agents_tool_v2_requires_targets_and_all_condition() {
+    let ToolSpec::Function(ResponsesApiTool {
+        name,
+        description,
+        parameters,
+        output_schema,
+        ..
+    }) = create_join_agents_tool_v2()
+    else {
+        panic!("join_agents should be a function tool");
+    };
+    assert_eq!(name, "join_agents");
+    assert!(description.contains("resume it exactly once"));
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("join_agents should use object params");
+    assert!(properties.contains_key("targets"));
+    assert_eq!(
+        properties["condition"].enum_values,
+        Some(vec![json!("all")])
+    );
+    assert_eq!(
+        parameters.required.as_ref(),
+        Some(&vec!["targets".to_string(), "condition".to_string()])
+    );
+    assert_eq!(output_schema, None);
+}
+
+#[test]
 fn list_agents_tool_includes_path_prefix_and_agent_fields() {
     let ToolSpec::Function(ResponsesApiTool {
         parameters,

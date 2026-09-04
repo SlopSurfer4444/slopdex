@@ -14,6 +14,7 @@ use futures::future::BoxFuture;
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -24,6 +25,8 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 
+use crate::agent::control::AgentExecutionGuard;
+use crate::agent::status::agent_status_from_event;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
@@ -50,6 +53,7 @@ use codex_otel::TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -72,6 +76,213 @@ const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 static ACTIVE_TURNS: Gauge = Gauge::new("core.turns.active");
 
 pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
+
+/// Opaque proof that execution capacity was checked and, for a V2 sub-agent,
+/// reserved atomically before task-start side effects.
+#[must_use = "execution reservations must be moved into a running task or dropped on unwind"]
+pub(crate) struct AgentExecutionReservation {
+    guard: Option<AgentExecutionGuard>,
+    taskless_claim_owner: Option<TasklessTurnClaimOwner>,
+}
+
+impl AgentExecutionReservation {
+    pub(crate) fn from_agent_control(guard: Option<AgentExecutionGuard>) -> Self {
+        Self {
+            guard,
+            taskless_claim_owner: None,
+        }
+    }
+
+    pub(crate) fn ensure_taskless_claim(&mut self) -> Arc<TasklessTurnClaim> {
+        if let Some(owner) = self.taskless_claim_owner.as_ref() {
+            return Arc::clone(&owner.claim);
+        }
+        let (claim, owner) = TasklessTurnClaim::new();
+        self.taskless_claim_owner = Some(owner);
+        claim
+    }
+
+    fn taskless_claim(&self) -> Option<Arc<TasklessTurnClaim>> {
+        self.taskless_claim_owner
+            .as_ref()
+            .map(|owner| Arc::clone(&owner.claim))
+    }
+
+    fn with_taskless_claim_owner(mut self, owner: TasklessTurnClaimOwner) -> Self {
+        self.taskless_claim_owner = Some(owner);
+        self
+    }
+
+    fn into_parts(mut self) -> (Option<AgentExecutionGuard>, Option<TasklessTurnClaimOwner>) {
+        (self.guard.take(), self.taskless_claim_owner.take())
+    }
+}
+
+pub(crate) enum UserTurnStartClaim {
+    Claimed {
+        reservation: AgentExecutionReservation,
+        turn_state: Arc<Mutex<TurnState>>,
+    },
+    SteerNow,
+    WaitForTask(Arc<TasklessTurnClaim>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TasklessTurnClaimStatus {
+    Starting,
+    Running,
+    Cancelled,
+}
+
+pub(crate) struct TasklessTurnClaim {
+    status: watch::Sender<TasklessTurnClaimStatus>,
+}
+
+impl TasklessTurnClaim {
+    fn new() -> (Arc<Self>, TasklessTurnClaimOwner) {
+        let (status, _) = watch::channel(TasklessTurnClaimStatus::Starting);
+        let claim = Arc::new(Self { status });
+        let owner = TasklessTurnClaimOwner {
+            claim: Arc::clone(&claim),
+            completed: false,
+        };
+        (claim, owner)
+    }
+
+    pub(crate) fn status(&self) -> TasklessTurnClaimStatus {
+        *self.status.borrow()
+    }
+
+    pub(crate) async fn wait(&self) -> TasklessTurnClaimStatus {
+        let mut status = self.status.subscribe();
+        loop {
+            let current = *status.borrow_and_update();
+            if current != TasklessTurnClaimStatus::Starting {
+                return current;
+            }
+            if status.changed().await.is_err() {
+                return TasklessTurnClaimStatus::Cancelled;
+            }
+        }
+    }
+
+    fn set_status(&self, next: TasklessTurnClaimStatus) {
+        self.status.send_if_modified(|current| {
+            if *current != TasklessTurnClaimStatus::Starting {
+                return false;
+            }
+            *current = next;
+            true
+        });
+    }
+}
+
+struct TasklessTurnClaimOwner {
+    claim: Arc<TasklessTurnClaim>,
+    completed: bool,
+}
+
+impl TasklessTurnClaimOwner {
+    fn complete(mut self) {
+        self.claim.set_status(TasklessTurnClaimStatus::Running);
+        self.completed = true;
+    }
+}
+
+impl Drop for TasklessTurnClaimOwner {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.claim.set_status(TasklessTurnClaimStatus::Cancelled);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct PendingWakeClaimBarrier {
+    point: PendingWakeBarrierPoint,
+    reached: Arc<Notify>,
+    proceed: Arc<Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PendingWakeBarrierPoint {
+    AfterClaim,
+    AfterCommit,
+}
+
+#[cfg(test)]
+impl PendingWakeClaimBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            point: PendingWakeBarrierPoint::AfterClaim,
+            reached: Arc::new(Notify::new()),
+            proceed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn after_commit() -> Self {
+        Self {
+            point: PendingWakeBarrierPoint::AfterCommit,
+            reached: Arc::new(Notify::new()),
+            proceed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_until_claimed(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.proceed.notify_one();
+    }
+
+    async fn pause_after_claim(&self) {
+        self.pause(PendingWakeBarrierPoint::AfterClaim).await;
+    }
+
+    async fn pause_after_commit(&self) {
+        self.pause(PendingWakeBarrierPoint::AfterCommit).await;
+    }
+
+    async fn pause(&self, point: PendingWakeBarrierPoint) {
+        if self.point == point {
+            self.reached.notify_one();
+            self.proceed.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TaskStartCommitBarrier {
+    reached: Arc<Notify>,
+    proceed: Arc<Notify>,
+}
+
+#[cfg(test)]
+impl TaskStartCommitBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: Arc::new(Notify::new()),
+            proceed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.proceed.notify_one();
+    }
+
+    async fn pause(&self) {
+        self.reached.notify_one();
+        self.proceed.notified().await;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
@@ -268,23 +479,208 @@ where
 }
 
 impl Session {
+    async fn execution_reservation_parameters(&self) -> (MultiAgentVersion, SessionSource) {
+        let config = self.get_config().await;
+        let multi_agent_version = self
+            .multi_agent_version()
+            .unwrap_or_else(|| config.multi_agent_version_from_features());
+        let session_source = self.execution_reservation_session_source().await;
+        (multi_agent_version, session_source)
+    }
+
+    pub(crate) async fn reserve_execution_capacity_for_turn_start(
+        &self,
+    ) -> CodexResult<AgentExecutionReservation> {
+        let (multi_agent_version, session_source) = self.execution_reservation_parameters().await;
+        self.services
+            .agent_control
+            .reserve_execution_capacity(multi_agent_version, &session_source)
+    }
+
+    pub(crate) async fn claim_execution_capacity_for_user_turn_start(
+        &self,
+    ) -> CodexResult<UserTurnStartClaim> {
+        let (multi_agent_version, session_source) = self.execution_reservation_parameters().await;
+        let mut active_turn = self.active_turn.lock().await;
+        loop {
+            let Some(turn) = active_turn.as_mut() else {
+                let mut reservation = self
+                    .services
+                    .agent_control
+                    .reserve_execution_capacity(multi_agent_version, &session_source)?;
+                let claim = reservation.ensure_taskless_claim();
+                let turn = ActiveTurn::with_taskless_start_claim(claim);
+                let turn_state = Arc::clone(&turn.turn_state);
+                *active_turn = Some(turn);
+                return Ok(UserTurnStartClaim::Claimed {
+                    reservation,
+                    turn_state,
+                });
+            };
+            if turn.task.is_some() {
+                return Ok(UserTurnStartClaim::SteerNow);
+            }
+            let Some(claim) = turn.taskless_start_claim() else {
+                *active_turn = None;
+                continue;
+            };
+            match claim.status() {
+                TasklessTurnClaimStatus::Cancelled => {
+                    *active_turn = None;
+                }
+                TasklessTurnClaimStatus::Running => {
+                    return Ok(UserTurnStartClaim::SteerNow);
+                }
+                TasklessTurnClaimStatus::Starting => {
+                    let Some(mut reservation) = turn.take_pending_wake_reservation_for_user()
+                    else {
+                        return Ok(UserTurnStartClaim::WaitForTask(claim));
+                    };
+                    let claim = reservation.ensure_taskless_claim();
+                    let turn = ActiveTurn::with_taskless_start_claim(claim);
+                    let turn_state = Arc::clone(&turn.turn_state);
+                    *active_turn = Some(turn);
+                    return Ok(UserTurnStartClaim::Claimed {
+                        reservation,
+                        turn_state,
+                    });
+                }
+            }
+        }
+    }
+
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) {
-        self.abort_all_tasks(TurnAbortReason::Replaced).await;
-        self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        let reservation = match self.services.agent_control.reserve_execution_capacity(
+            turn_context.multi_agent_version,
+            &turn_context.session_source,
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+                )
+                .await;
+                return;
+            }
+        };
+        self.spawn_task_with_reservation(turn_context, input, task, reservation)
+            .await;
     }
 
+    pub(crate) async fn spawn_task_with_reservation<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        reservation: AgentExecutionReservation,
+    ) {
+        self.abort_all_tasks(TurnAbortReason::Replaced).await;
+        self.clear_connector_selection().await;
+        self.start_task_with_reservation(turn_context, input, task, reservation)
+            .await;
+    }
+
+    #[cfg(test)]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let reservation = match self.services.agent_control.reserve_execution_capacity(
+            turn_context.multi_agent_version,
+            &turn_context.session_source,
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+                )
+                .await;
+                return;
+            }
+        };
+        self.start_task_with_reservation(turn_context, input, task, reservation)
+            .await;
+    }
+
+    pub(crate) async fn start_task_with_reservation<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        reservation: AgentExecutionReservation,
+    ) {
+        self.start_task_with_reservation_inner(
+            turn_context,
+            input,
+            task,
+            reservation,
+            #[cfg(test)]
+            None,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_task_with_reservation_and_barrier<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        reservation: AgentExecutionReservation,
+        barrier: TaskStartCommitBarrier,
+    ) {
+        self.start_task_with_reservation_inner(
+            turn_context,
+            input,
+            task,
+            reservation,
+            Some(barrier),
+        )
+        .await;
+    }
+
+    async fn start_task_with_reservation_inner<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        mut reservation: AgentExecutionReservation,
+        #[cfg(test)] barrier: Option<TaskStartCommitBarrier>,
+    ) {
+        let (taskless_claim, turn_state) = {
+            let mut active = self.active_turn.lock().await;
+            if let Some(taskless_claim) = reservation.taskless_claim() {
+                let Some(turn) = active.as_ref() else {
+                    return;
+                };
+                if turn.task.is_some()
+                    || !turn
+                        .taskless_start_claim()
+                        .is_some_and(|claim| Arc::ptr_eq(&claim, &taskless_claim))
+                {
+                    return;
+                }
+                (taskless_claim, Arc::clone(&turn.turn_state))
+            } else {
+                if active.is_some() {
+                    return;
+                }
+                let taskless_claim = reservation.ensure_taskless_claim();
+                let turn = ActiveTurn::with_taskless_start_claim(Arc::clone(&taskless_claim));
+                let turn_state = Arc::clone(&turn.turn_state);
+                *active = Some(turn);
+                (taskless_claim, turn_state)
+            }
+        };
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
@@ -307,7 +703,28 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let (pending_items, start_options) = self.input_queue.drain_mailbox_input_items().await;
+        #[cfg(test)]
+        if let Some(barrier) = barrier.as_ref() {
+            barrier.pause().await;
+        }
+
+        let mut active = self.active_turn.lock().await;
+        let Some(turn) = active.as_mut() else {
+            return;
+        };
+        let Some(start_options) = self
+            .input_queue
+            .commit_startup_mailbox_for_turn(
+                turn,
+                &taskless_claim,
+                &turn_state,
+                &turn_context.sub_id,
+                token_usage_at_turn_start.clone(),
+            )
+            .await
+        else {
+            return;
+        };
         if turn_context.turn_metadata_state.root_turn_id().is_none()
             && let Some(root_turn_id) = start_options.root_turn_id
         {
@@ -315,32 +732,14 @@ impl Session {
                 .turn_metadata_state
                 .set_root_turn_id(root_turn_id);
         }
-        let turn_state = {
-            let mut active = self.active_turn.lock().await;
-            let turn = active.get_or_insert_with(ActiveTurn::default);
-            debug_assert!(turn.task.is_none());
-            Arc::clone(&turn.turn_state)
-        };
-        turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
-            .await;
-        self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
-            .await;
 
-        let mut active = self.active_turn.lock().await;
-        let turn = active.get_or_insert_with(ActiveTurn::default);
-        debug_assert!(turn.task.is_none());
-        let agent_execution_guard = self.services.agent_control.execution_guard(
-            turn_context.multi_agent_version,
-            &turn_context.session_source,
-        );
         let done_clone = Arc::clone(&done);
         let session = Arc::clone(self);
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_input = input;
         let task_cancellation_token = cancellation_token.child_token();
+        let (task_start_tx, task_start_rx) = tokio::sync::oneshot::channel::<()>();
         // Task-owned turn spans keep a core-owned span open for the
         // full task lifecycle after the submission dispatch span ends.
         let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
@@ -361,6 +760,7 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
+                let _ = task_start_rx.await;
                 let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
@@ -397,6 +797,7 @@ impl Session {
             .session_telemetry
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
+        let (agent_execution_guard, taskless_claim_owner) = reservation.into_parts();
         let running_task = RunningTask {
             done,
             handle: AbortOnDropHandle::new(handle),
@@ -409,6 +810,14 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        if let Some(owner) = taskless_claim_owner {
+            owner.complete();
+        }
+        turn.finish_taskless_start();
+        drop(active);
+        self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
+            .await;
+        let _ = task_start_tx.send(());
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -444,6 +853,29 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
+        self.maybe_start_turn_for_pending_work_with_sub_id_inner(
+            sub_id,
+            #[cfg(test)]
+            None,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id_and_barrier(
+        self: &Arc<Self>,
+        sub_id: String,
+        barrier: PendingWakeClaimBarrier,
+    ) {
+        self.maybe_start_turn_for_pending_work_with_sub_id_inner(sub_id, Some(barrier))
+            .await;
+    }
+
+    async fn maybe_start_turn_for_pending_work_with_sub_id_inner(
+        self: &Arc<Self>,
+        sub_id: String,
+        #[cfg(test)] barrier: Option<PendingWakeClaimBarrier>,
+    ) {
         if !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
@@ -451,17 +883,52 @@ impl Session {
             return;
         }
 
-        let turn_state = {
+        let (multi_agent_version, session_source) = self.execution_reservation_parameters().await;
+        let (turn_state, claim_owner) = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
                 return;
             }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
+            let reservation = match self
+                .services
+                .agent_control
+                .reserve_execution_capacity(multi_agent_version, &session_source)
+            {
+                Ok(reservation) => reservation,
+                Err(_) => return,
+            };
+            let (claim, claim_owner) = TasklessTurnClaim::new();
+            let active_turn = active_turn.get_or_insert_with(|| {
+                ActiveTurn::with_pending_wake_reservation(reservation, claim)
+            });
+            (Arc::clone(&active_turn.turn_state), claim_owner)
         };
 
-        let (input, mut start_options) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
+        #[cfg(test)]
+        if let Some(barrier) = barrier.as_ref() {
+            barrier.pause_after_claim().await;
+        }
+
+        let reservation = {
+            let mut active_turn = self.active_turn.lock().await;
+            let Some(active_turn) = active_turn.as_mut() else {
+                return;
+            };
+            if active_turn.task.is_some() || !Arc::ptr_eq(&active_turn.turn_state, &turn_state) {
+                return;
+            }
+            let Some(reservation) = active_turn.commit_pending_wake() else {
+                return;
+            };
+            reservation.with_taskless_claim_owner(claim_owner)
+        };
+
+        #[cfg(test)]
+        if let Some(barrier) = barrier.as_ref() {
+            barrier.pause_after_commit().await;
+        }
+
+        let (input, mut start_options) = self.input_queue.preview_mailbox_input_items().await;
         if !input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) {
@@ -500,11 +967,7 @@ impl Session {
         }
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        // Task completion must still save this mail if pre-turn compaction fails.
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
-            .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
+        self.start_task_with_reservation(turn_context, Vec::new(), RegularTask::new(), reservation)
             .await;
     }
 
@@ -835,6 +1298,21 @@ impl Session {
                 time_to_first_token_ms,
             })
         };
+        if let Some(status) = agent_status_from_event(&event) {
+            self.input_queue
+                .record_nested_join_turn_terminal(
+                    self.thread_id,
+                    &turn_context.sub_id,
+                    &turn_state,
+                    status,
+                )
+                .await;
+        }
+        if turn_context.parent_thread_id.is_none() {
+            self.input_queue
+                .finish_root_join_continuations(self.thread_id, &turn_context.sub_id, &turn_state)
+                .await;
+        }
         self.send_event(turn_context.as_ref(), event).await;
         self.services
             .guardian_rejection_circuit_breaker
@@ -903,7 +1381,7 @@ impl Session {
         self: &Arc<Self>,
         task: RunningTask,
         reason: TurnAbortReason,
-        turn_state: &Mutex<TurnState>,
+        turn_state: &Arc<Mutex<TurnState>>,
     ) {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
@@ -990,6 +1468,25 @@ impl Session {
             completed_at,
             duration_ms,
         });
+        if let Some(status) = agent_status_from_event(&event) {
+            self.input_queue
+                .record_nested_join_turn_terminal(
+                    self.thread_id,
+                    &task.turn_context.sub_id,
+                    turn_state,
+                    status,
+                )
+                .await;
+        }
+        if task.turn_context.parent_thread_id.is_none() {
+            self.input_queue
+                .finish_root_join_continuations(
+                    self.thread_id,
+                    &task.turn_context.sub_id,
+                    turn_state,
+                )
+                .await;
+        }
         self.send_event(task.turn_context.as_ref(), event).await;
         self.services
             .guardian_rejection_circuit_breaker

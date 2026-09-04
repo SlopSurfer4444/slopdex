@@ -23,7 +23,9 @@ use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::session::TurnInputQueue;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::tasks::AgentExecutionReservation;
 use crate::tasks::AnySessionTask;
+use crate::tasks::TasklessTurnClaim;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::ReviewDecision;
@@ -33,6 +35,13 @@ use codex_protocol::protocol::TokenUsage;
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    taskless_start_claim: Option<Arc<TasklessTurnClaim>>,
+    pending_wake_start: Option<PendingWakeStart>,
+}
+
+struct PendingWakeStart {
+    reservation: Option<AgentExecutionReservation>,
+    committed: bool,
 }
 
 /// Whether mailbox deliveries should still be folded into the current turn.
@@ -61,7 +70,66 @@ impl Default for ActiveTurn {
         Self {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            taskless_start_claim: None,
+            pending_wake_start: None,
         }
+    }
+}
+
+impl ActiveTurn {
+    pub(crate) fn with_taskless_start_claim(claim: Arc<TasklessTurnClaim>) -> Self {
+        Self {
+            taskless_start_claim: Some(claim),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_pending_wake_reservation(
+        reservation: AgentExecutionReservation,
+        claim: Arc<TasklessTurnClaim>,
+    ) -> Self {
+        Self {
+            taskless_start_claim: Some(claim),
+            pending_wake_start: Some(PendingWakeStart {
+                reservation: Some(reservation),
+                committed: false,
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn taskless_start_claim(&self) -> Option<Arc<TasklessTurnClaim>> {
+        self.taskless_start_claim.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn ensure_taskless_start_claim(&mut self, claim: Arc<TasklessTurnClaim>) {
+        self.taskless_start_claim.get_or_insert(claim);
+    }
+
+    pub(crate) fn take_pending_wake_reservation_for_user(
+        &mut self,
+    ) -> Option<AgentExecutionReservation> {
+        let pending = self.pending_wake_start.as_ref()?;
+        if pending.committed {
+            return None;
+        }
+        self.pending_wake_start
+            .take()
+            .and_then(|mut pending| pending.reservation.take())
+    }
+
+    pub(crate) fn commit_pending_wake(&mut self) -> Option<AgentExecutionReservation> {
+        let pending = self.pending_wake_start.as_mut()?;
+        if pending.committed {
+            return None;
+        }
+        pending.committed = true;
+        pending.reservation.take()
+    }
+
+    pub(crate) fn finish_taskless_start(&mut self) {
+        self.pending_wake_start = None;
+        self.taskless_start_claim = None;
     }
 }
 

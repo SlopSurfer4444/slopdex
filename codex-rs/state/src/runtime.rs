@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tracing::warn;
 
 mod backfill;
@@ -50,9 +51,15 @@ mod recovery;
 mod remote_control;
 mod rollout_migration;
 #[cfg(test)]
+#[path = "runtime/test_fixture.rs"]
+mod test_fixture;
+#[cfg(test)]
 pub(crate) mod test_support;
 mod thread_section_order;
 mod thread_sections;
+#[cfg(test)]
+#[path = "runtime/thread_spawn_edge_tests.rs"]
+mod thread_spawn_edge_tests;
 mod threads;
 
 pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;
@@ -95,9 +102,15 @@ pub struct StateRuntime {
     thread_queue: SqliteQueueStore,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
+    /// Serializes process-local durable spawn-edge admission and deletion.
+    thread_spawn_edge_fence: Arc<Mutex<()>>,
 }
 
 impl StateRuntime {
+    async fn acquire_thread_spawn_edge_fence(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.thread_spawn_edge_fence).lock_owned().await
+    }
+
     /// Initialize the state runtime using the provided SQLite configuration and default provider.
     ///
     /// This opens (and migrates) the SQLite databases under the configured
@@ -258,6 +271,7 @@ impl StateRuntime {
             default_provider,
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
             thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
+            thread_spawn_edge_fence: Arc::new(Mutex::new(())),
         });
         if let Err(err) = runtime.run_logs_startup_maintenance().await {
             warn!(
