@@ -1,0 +1,88 @@
+{
+  "schema": "slopdex-release-manifest-v3",
+  "publicDestinations": {
+    "repository": "https://github.com/SlopSurfer4444/slopdex",
+    "distribution": "SOURCE_DROP_ONLY",
+    "layout": "full source checkout from the pinned upstream base plus the accepted 57-path content; receipts and policy material are under slopdex/",
+    "productSourceCommit": "e497c3d358ae4a3411b0bd16b1ea7e79051e9aa7",
+    "productSourceTree": "819d97ef1dc02bd51aae7d99d88951940584e057",
+    "artifactAvailability": "PRIVATELY_HELD_NOT_DISTRIBUTED"
+  },
+  "source": {
+    "repository": "https://github.com/openai/codex",
+    "head": "612e6491d50ffb80ffc4330edc4024b86e51e4bf",
+    "tree": "568d39f181926f57c73dd34c2fceb419bab1979e",
+    "posture": "detached",
+    "trackedChangedPathCount": 37,
+    "untrackedPathCount": 20,
+    "canonicalContentManifest": "provenance/canonical-content-manifest.txt",
+    "canonicalContentManifestSha256": "159abbdba8f1d59d996b1dfa88b4a64eb968ae4683cea58f1965dad7d34bde65",
+    "canonicalContentManifestAlgorithm": "sha256 of sorted UTF-8 LF-terminated T<TAB>path<TAB>lowercase-file-sha256 / U<TAB>path<TAB>lowercase-file-sha256 records"
+  },
+  "artifacts": [
+    {
+      "role": "cli",
+      "file": "artifact/slopdex-windows-x64.exe",
+      "bytes": 298399744,
+      "sha256": "fe0662c5486da33415eb3775630cdc83aa9d5636c05e5c8b14b5c3e86f52a175"
+    },
+    {
+      "role": "codeModeHost",
+      "file": "artifact/codex-code-mode-host.exe",
+      "bytes": 73581568,
+      "sha256": "8c1e06c7c164d09c21a7b988908c1fe268ce4840eb32732943d2d062446116b6"
+    },
+    {
+      "role": "commandRunner",
+      "file": "artifact/codex-command-runner.exe",
+      "bytes": 8219648,
+      "sha256": "9e7a53cc5657ed0b915c6fbdf4bc74759a902f8e9396ccee990ee2348ceeae95"
+    },
+    {
+      "role": "windowsSandboxSetup",
+      "file": "artifact/codex-windows-sandbox-setup.exe",
+      "bytes": 15521792,
+      "sha256": "510ee34ad331f89505253275645523d68dab5460c746af02a6bf4244efcad09d"
+    }
+  ],
+  "build": {
+    "status": "BUILD_ACCEPTED",
+    "privateReceiptSha256": "12b331bd4bb6dcc103deaefc979c8d6a309a72d6c0dcc7d4b3d9432b204a3b4e",
+    "publicReceiptStatus": "SANITIZED_PUBLIC_RECEIPT",
+    "cliSmoke": "--version => codex-cli 0.0.0; exit 0; bounded non-network smoke",
+    "installedDesktopBinding": "VERIFIED_EXACT_CLI_SHA256"
+  },
+  "sourcePatch": {
+    "status": "EXACT_BASE_APPLY_AND_CONTENT_CLOSURE_PASS",
+    "file": "source/slopdex-612e6491d50f.patch",
+    "bytes": 2876642,
+    "sha256": "b4cd2ce24d68c323a8d6f1406a3421248ea76781955f2296e55258e30e687b98",
+    "targetTree": "819d97ef1dc02bd51aae7d99d88951940584e057",
+    "pathCount": 57,
+    "newFileCount": 20,
+    "generation": "task-private index and object directory; raw blobs inserted with hash-object --no-filters; source objects used only as alternate",
+    "verification": "independent exact-base cached apply; identical target tree and 57 object IDs; core.autocrlf=false materialization matched all 57 canonical SHA-256 values",
+    "lineEndings": "39 LF-only files and 18 mixed CRLF/LF files; automatic checkout conversion can change working-tree byte hashes",
+    "publicationClone": "independent clean-clone apply matched target tree and all 57 paths; resulting source commit e497c3d358ae4a3411b0bd16b1ea7e79051e9aa7"
+  },
+  "capacity": {
+    "defaultAgentMaxThreads": 128,
+    "v2MaxConcurrencyIncludingRoot": 128,
+    "defaultAgentMaxDepth": 128,
+    "depthConfigKey": "agents.max_depth",
+    "claimCeiling": "configuration limits only; depth is not unlimited and workload safety or backend acceptance is not implied"
+  },
+  "dogfood": {
+    "status": "LIVE_NESTED_RETAINED_SUCCESSOR_SAMPLE_PASS",
+    "receipt": "dogfood/README.md",
+    "topology": "root -> Astra verifier -> Terra verifier -> Luna checksum",
+    "observed": "distinct intermediate Terra PENDING delivery followed by a distinct successor result; no second join and no same exact terminal delivered twice",
+    "claimCeiling": "one observed retained-successor sample only; no global exactly-once, crash recovery, arbitrary graph reliability, backend routing, performance, or production-readiness claim"
+  },
+  "privacy": {
+    "status": "SOURCE_DROP_CLEAR_BINARY_DISTRIBUTION_DEFERRED",
+    "finding": "machine-local compiler source-location paths are embedded in all four accepted executables; no credential or runtime-config material was observed",
+    "sourceAndTextPayload": "NO_LOCAL_ROOT_OR_CREDENTIAL_FINDING",
+    "binaryDecision": "held locally; owner deferred binary publication"
+  }
+}

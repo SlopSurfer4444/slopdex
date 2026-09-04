@@ -1,81 +1,125 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Slopdex
 
----
+**One thread. A whole workshop behind it.**
 
-## Quickstart
+Slopdex is a power-user Codex source preview for recursive agent work: keep the
+architecture in one conversation, split useful independent work into temporary
+trees, and bring results back to the agents responsible for them.
 
-### Installing and running Codex CLI
+**This is the first source drop.** The modified Rust source and tests are in
+this repository, alongside the portable patch, verification notes and optional
+orchestration skills. A Windows build has been tested locally; downloadable
+binaries will be published separately. Nothing here replaces your installed
+Codex automatically.
 
-Run the following on Mac or Linux to install Codex CLI:
+This is an independent derivative of [OpenAI Codex](https://github.com/openai/codex),
+not an official OpenAI release or an OpenAI-endorsed project.
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+## Start here
+
+- [What we learned: from Sol to the Astra chapter](slopdex/SHORTGRID.en.md)
+- [What changed](slopdex/RELEASE_NOTES.md)
+- [Known limitations and findings not claimed as fixed](slopdex/KNOWN_LIMITATIONS.md)
+- [Source and build provenance](slopdex/provenance/)
+- [Observed live nested completion](slopdex/dogfood/)
+- [Optional skills and global instruction sample](slopdex/policy/)
+- [Portable patch against the pinned upstream](slopdex/source/)
+- [The original public discussion, #40037](https://github.com/openai/codex/issues/40037)
+
+## What is in this checkpoint?
+
+| Area | Included behavior |
+| --- | --- |
+| Capacity | Defaults raised to 128 in the supported agent configuration; capacity is permission to use a graph, not a target agent count. |
+| Depth | Configurable recursive depth, default 128. This does not promise infinite depth or identical orchestration capabilities for every model. |
+| Owned joins | Direct-child and turn binding, with retained ownership across the nested successor continuation covered by the implementation. |
+| Delivery | Nearest-parent aggregation, duplicate suppression for the relevant delivery identity, user-turn priority and recovery from a lagged terminal signal. |
+| Spawn lifecycle | Required spawn-edge persistence and fail-closed admission when the required store is unavailable. |
+| Resource lifecycle | Capacity and residency handling so terminal work and retained obligations are treated appropriately. |
+| Verification | Focused, independently runnable source tests around these contracts. |
+
+The source candidate contains 57 changed or added paths. Its recorded owner
+test group passed 82/82, and independent source review accepted that candidate.
+Those are scoped results, not a claim that every upstream suite or every
+possible runtime scenario passed.
+
+The local Windows dogfood observed a nested parent-to-coordinator-to-leaf
+chain deliver an intermediate result and then the distinct successor's
+aggregate. That sequence matches retained ownership; two different results
+are not automatically a duplicate delivery. See the receipt for the exact
+claim and exclusions. Restart/crash exactly-once replay is not claimed.
+
+## Build the source
+
+The baseline is upstream commit
+[`612e6491d50ffb80ffc4330edc4024b86e51e4bf`](https://github.com/openai/codex/commit/612e6491d50ffb80ffc4330edc4024b86e51e4bf).
+This checkout already contains the Slopdex changes: do **not** apply the
+portable patch to it again.
+
+Use the repository's Rust toolchain and platform build prerequisites. A
+normal CLI build starts with:
+
+```sh
+git clone https://github.com/SlopSurfer4444/slopdex.git
+cd slopdex/codex-rs
+cargo build --locked --release -p codex-cli
 ```
 
-Run the following on Windows to install Codex CLI:
+Run `target/release/codex` (`target/release/codex.exe` on Windows). Keep your
+normal Codex installation and state separate when evaluating the preview.
+The upstream source, dependency locks and build documentation are retained.
+The Windows build receipt records the additional helper binaries used for
+our local Desktop integration; a portable Desktop installer is not included.
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
+The patch in `slopdex/source/` is for applying this candidate to a clean
+checkout of the pinned upstream instead. Its receipt documents line endings,
+the complete path set and the application check. Bit-for-bit reproducible
+executables across machines are not claimed.
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+## The optional operating stack
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
+The runtime and the instructions solve different parts of the problem. The
+skills teach the working pattern: maintain a campaign dependency graph,
+launch ready independent branches, choose models with enough capability,
+and aggregate through the nearest responsible agent. They do not require a
+fixed number of agents or a permanent coordinator for every task.
 
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
+Review [the policy bundle](slopdex/policy/) before installing it. It is the
+configuration we arrived at through field work, offered as a starting point.
+You can use the code without it.
 
-Codex CLI can also be installed via the following package managers:
+With the skills installed, open your project and say:
 
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
+> You are the parent architect for this project. Read and follow
+> `$control-role-boundary`. Take the campaign to an honest result.
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+The parent creates an operational coordinator when the work benefits from
+one. Independent writers are useful only when their write surfaces and
+dependencies really are separate.
 
-Then simply run `codex` to get started.
+## Built with Sol. Next: Astra.
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+GPT-5.6 Sol led this campaign, with Terra and Luna contributing. The accepted
+source, tests, source review and locally built artifact were frozen before
+the parent conversation switched to Astra. Astra participated in final
+installed-runtime checks and publication preparation.
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+Now we will test how much this approach helps with Astra: completion time,
+cost, repeated work and the amount of owner intervention. We may simplify
+the skills or retire patches as upstream covers their behavior. The current
+observations are field evidence, not a controlled token-economics benchmark.
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+**On Sol: just try it. On Astra: let's find out.** Early mechanics checks do
+not yet establish the stack's overall usefulness or economics on Astra.
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+Give it a real task. Tell us where the graph helps, where it wastes effort,
+and where it fails. A reproducible counterexample is welcome.
 
-</details>
+> I did not leave Codex for another orchestrator. I liked Codex enough that,
+> when its limits got in the way of my work, I started moving the limits myself.
 
-### Using Codex with your ChatGPT plan
+## Attribution and license
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+Codex is developed by OpenAI and its contributors. The upstream [LICENSE](LICENSE)
+and [NOTICE](NOTICE) are preserved; see [Slopdex attribution](slopdex/ATTRIBUTION.md)
+for the derivative source and instruction bundle.
