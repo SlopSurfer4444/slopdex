@@ -23,6 +23,8 @@ coordination costs more than it returns.
 - One shared mutable surface has one owner. Parallel writers require proven
   disjoint roots and an explicit fan-in owner; otherwise keep alternatives
   read-only until one writer is selected.
+- Add a coordinator only for useful bounded work, never as a mandatory tier
+  or a manually admitted title.
 
 ## Wait, join, and delivery
 
@@ -54,9 +56,17 @@ For consequential operations, bind an attempt identity and record the outcome
 before follow-up changes the evidence surface. Missing or interrupted outcomes
 remain unknown until reconciled; do not blind-retry.
 
-Treat each material candidate as one exact path set and generation. Stop
-writers before final hashes and create the receipt last. A post-freeze byte
-change invalidates that generation's review and receipt.
+Already-authorized offline implementation, tests and in-scope repairs iterate
+normally without renewed approval or a new attempt ceremony. A material
+`BLOCK`/`STOP` prevents acceptance and consequential use of the affected
+candidate; it does not cancel authorized repair. Explicit user pauses, scope
+limits and genuine safety stops still apply.
+
+Bind acceptance to an exact path set and one integration owner. Stop its
+writers before final hashes and create the receipt last. Repairs create a new
+generation: preserve historical receipts, reuse only evidence whose source,
+dependencies and claims remain valid, and refresh affected proofs and final
+bindings. Never mix generations or patch only the receipt.
 
 ## Verification and hygiene
 

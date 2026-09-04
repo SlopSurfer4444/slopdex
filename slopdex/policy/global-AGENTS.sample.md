@@ -8,7 +8,10 @@ Repository contracts, direct user instructions, and actual runtime limits win.
   when no useful independent branch remains.
 - Load `$campaign-dag-orchestration` only when several slices converge on one
   meaningful integration, migration, build, or release checkpoint.
-- Load `$control-role-boundary` only after explicit admission to a named role
-  and domain. A role changes behaviour, never authority.
+- Choose topology from useful work, not role titles. Add a coordinator only
+  when its bounded ownership reduces context, latency, or shared-state risk.
 - Before every child dispatch, choose model and reasoning explicitly, give the
   child bounded scope and one consumer, and preserve shared-state ownership.
+- Continue already-authorized offline implementation, tests and in-scope
+  repairs without renewed approval. A failed or frozen candidate blocks its
+  acceptance, not repair; preserve explicit user pauses and real safety gates.

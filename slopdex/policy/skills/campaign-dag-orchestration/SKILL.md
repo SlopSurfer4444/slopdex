@@ -13,7 +13,8 @@ a second scheduler or a census of live agents. Use
 
 ## Compile the horizon
 
-Before mutation, bind one compact campaign packet containing:
+Before mutation, bind one compact campaign record, reusing an existing plan or
+ledger, containing:
 
 - objective, exclusions, authority, participating root identities, acceptance
   conditions, and terminal checkpoint;
@@ -38,10 +39,12 @@ an implicit prerequisite of that lane.
    source and evidence identity.
 5. Update the ledger, recompute readiness, and admit the next useful wave.
 
-Preserve rejected and superseded receipts. Replan only when the owner changes
-the terminal contract, a bound root changes, or evidence invalidates a
-dependency or architecture premise. Do not replan merely because a turn ends,
-time passes, or a remote branch moves.
+Preserve rejected and superseded receipts. Update the same record with a
+replan only when the owner changes the terminal contract or authority, a
+frozen baseline or external evidence identity is replaced, or evidence changes
+a dependency or architecture premise. Planned candidate progress and in-scope
+repair do not require a global replan or a separate document. Do not replan
+merely because a turn ends, time passes, or a remote branch moves.
 
 Keep an observational ledger of campaign identity, frozen roots, terminal
 checkpoint, node state, dependencies, owners/consumers, candidate generations,

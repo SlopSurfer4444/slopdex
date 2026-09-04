@@ -15,10 +15,14 @@ limitations, release notes, and sanitized live receipt.
   not machine values.
 - Public URLs are limited to the upstream `openai/codex` repository and the
   owner-selected `SlopSurfer4444/slopdex` repository.
-- Every relative Markdown link resolves inside this material set.
-- Every `references/...` link in a copied skill resolves. The campaign skill
-  includes its frozen-upstream reference; the control-role skill includes its
-  parent-architect, operational-coordinator, and crash-recovery references.
+- Relative Markdown links in the authored Slopdex guides and current policy
+  resolve inside the repository. The preserved `UPSTREAM_README.md` excerpt
+  is not a relocated installation guide; its original source-relative links
+  are outside this closure check.
+- Every `references/...` link in the three current skills resolves. The
+  campaign skill includes its frozen-upstream reference. The retired role
+  skill and its three references are no longer in the installable bundle;
+  earlier versions remain in Git history.
 
 ## Exact source closure
 
