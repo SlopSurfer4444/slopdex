@@ -15,6 +15,9 @@ limitations, release notes, and sanitized live receipt.
   not machine values.
 - Public URLs are limited to the upstream `openai/codex` repository and the
   owner-selected `SlopSurfer4444/slopdex` repository.
+- The current public narrative is the English shortgrid. Owner-review drafts
+  are not part of the current published file set; earlier commits remain in
+  Git history.
 - Relative Markdown links in the authored Slopdex guides and current policy
   resolve inside the repository. The preserved `UPSTREAM_README.md` excerpt
   is not a relocated installation guide; its original source-relative links

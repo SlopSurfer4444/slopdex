@@ -86,16 +86,24 @@ launch ready independent branches, choose models with enough capability,
 and aggregate through the nearest responsible agent. They do not require a
 fixed number of agents or a permanent coordinator for every task.
 
-The [policy bundle](slopdex/policy/) preserves the historical Sol configuration.
-You can use the code without it; review the files before adopting them.
+The [current optional recipe](slopdex/policy/README.md) combines three skills:
+
+- [Aggressive recursive orchestration](slopdex/policy/skills/aggressive-recursive-orchestration/SKILL.md): find useful independent branches and choose models deliberately.
+- [Adaptive orchestration](slopdex/policy/skills/adaptive-orchestration/SKILL.md): own results, wait natively, verify evidence and iterate safely.
+- [Campaign DAG orchestration](slopdex/policy/skills/campaign-dag-orchestration/SKILL.md): keep one dependency plan and launch ready waves toward a shared checkpoint.
+
+The [global instruction sample](slopdex/policy/global-AGENTS.sample.md) connects
+them. Follow the recipe's installation steps and review the files before
+adopting them; you can use Slopdex without this stack.
 
 **Post-drop decision, 2026-09-05:** in the first Astra field campaigns we chose
 to retire the separate role-initialization layer from the active recipe. Give
 the project an ordinary task; a separate coordinator is useful when the work
 justifies one, not because the user remembered a title or skill name. Scope,
 ownership, verification and real approval boundaries still apply. See
-[the policy-evolution note](slopdex/policy/EVOLUTION.md); the original Sol
-snapshot and narrative are retained, and global rollout is a separate action.
+[the policy-evolution note](slopdex/policy/EVOLUTION.md). The earlier Sol
+configuration remains in Git history; the public English narrative preserves
+that chapter. Nothing in this repository changes your global settings automatically.
 
 Independent writers are useful only when their write surfaces and dependencies
 really are separate.
