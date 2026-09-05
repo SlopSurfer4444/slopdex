@@ -1,9 +1,25 @@
-# Slopdex source-drop notes
+# Slopdex release notes
 
-The current owner-authorized publication target is the full source tree at
+## v0.1.0-preview.1: Windows x64 CLI archive
+
+The [downloadable preview](https://github.com/SlopSurfer4444/slopdex/releases/tag/v0.1.0-preview.1)
+contains a later privacy-remapped build of the same accepted 57-path source.
+There are no new product patches in this binary upload and it is not yet the
+newer-upstream transplant. All four EXEs come from one successful Windows
+MSVC build; exact offline launch checks and the documented local-path scan
+passed. See [usage](PORTABLE_WINDOWS.md) and [r2 provenance](provenance/WINDOWS_RELEASE_R2.md).
+
+The Sol-led source work and original live artifact remain the historical
+checkpoint below. The privacy rebuild was coordinated after the switch to
+Astra; its binary hashes are different. Historical live-dogfood evidence is
+not relabeled as a live test of the new archive.
+
+## Historical source drop
+
+The original source publication was the full source tree at
 [SlopSurfer4444/slopdex](https://github.com/SlopSurfer4444/slopdex), produced
-from the pinned upstream base and the accepted 57-path patch. Windows binary
-distribution is deferred and no release ZIP is part of this source drop.
+from the pinned upstream base and the accepted 57-path patch. Binary
+distribution was deferred at that checkpoint.
 
 ## Frozen identity
 

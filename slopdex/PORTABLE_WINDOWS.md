@@ -1,37 +1,58 @@
-# Deferred Windows binary notes
+# Slopdex for Windows x64
 
-Binary distribution is deferred by the owner. The current public action is a
-source-only drop; there is no runnable download or installer. These notes
-describe the local held generation only.
+Download the ZIP and its `.sha256` file from
+[v0.1.0-preview.1](https://github.com/SlopSurfer4444/slopdex/releases/tag/v0.1.0-preview.1).
+This is a portable CLI preview, not the ChatGPT/Codex Desktop application or
+an installer. It does not change your existing installation, PATH or launcher.
 
-If a later separately authorized binary release reuses this generation, all
-four files must remain together and the three `codex-*` helpers must not be
-renamed.
+## Start
 
-The local non-network verification invocation was:
+1. Compare the archive's SHA-256 with the accompanying checksum file:
 
-```powershell
-.\artifact\slopdex-windows-x64.exe --version
-```
+   ```powershell
+   Get-FileHash .\slopdex-v0.1.0-preview.1-windows-x86_64.zip -Algorithm SHA256
+   ```
 
-It returned `codex-cli 0.0.0` with exit code 0. No interactive CLI use was
-included in package preparation.
+2. Extract the entire archive into a new folder. Keep all four EXEs together.
+3. Open that folder in a terminal:
 
-## Helper compatibility
+   ```powershell
+   .\codex.exe --version
+   .\codex.exe
+   ```
 
-- All four executables are Windows x64 MSVC release outputs from the same
-  accepted build generation.
-- `codex-code-mode-host.exe` is discovered next to the CLI when Code Mode is
-  enabled. Its bounded `--help` invocation exited 0 during package preparation.
-- `codex-command-runner.exe` and `codex-windows-sandbox-setup.exe` are internal
-  protocol helpers discovered next to the CLI. They are not user-facing
-  commands and should not be invoked directly.
-- The CLI filename may remain `slopdex-windows-x64.exe`; helper discovery is
-  based on the executable directory and the exact helper filenames.
-- No cross-platform, installer, PATH registration, file association,
-  auto-update, or broad Windows sandbox guarantee is claimed.
+The executable retains the upstream name `codex.exe`. It currently reports
+`codex-cli 0.0.0`; identify this preview by its release name and checksums,
+not that version string alone. Authenticate through the CLI's supported flow
+if requested; never copy tokens or session files into bug reports.
 
-The accepted binaries embed compiler source-location paths containing local
-build-root prefixes. They contain no observed credential or runtime config,
-but remain held locally under the current owner decision. A future binary
-generation needs its own authority and privacy acceptance.
+The archive does not include account state. Interactive CLI use can read or
+write normal Codex configuration and state; extraction itself does neither.
+Evaluate the preview in a disposable project or separate test environment.
+Do not disable operating-system security protections to run it.
+
+## Included files
+
+- `codex.exe`: the user-facing CLI.
+- `codex-code-mode-host.exe`: sibling helper used for Code Mode.
+- `codex-command-runner.exe` and `codex-windows-sandbox-setup.exe`: internal
+  protocol helpers, not commands to invoke directly.
+- English usage/build notes, upstream LICENSE/NOTICE and internal checksums.
+
+The [r2 build receipt](provenance/WINDOWS_RELEASE_R2.md) binds the four hashes,
+source identity and exact verification scope. Compiler-local source/cache
+paths were remapped during compilation; binaries were not stripped or patched
+afterward. This package is not a signed or supported OpenAI release.
+
+## Scope
+
+The source is the published 57-path Slopdex candidate on upstream `612e6491`.
+Migration to a newer upstream is separate work, not part of this archive.
+This exact rebuild passed bounded offline launch/protocol checks and the
+documented local-path scan. It has not been installed into Desktop or used
+for a new live recursive-model campaign. The earlier nested dogfood receipt
+belongs to a different binary generation of the same source.
+
+See [known limitations](KNOWN_LIMITATIONS.md), including the unresolved Windows
+sandbox temporary-directory seam. No restart/crash replay, arbitrary graph
+reliability, general sandbox-safety or cross-platform binary claim is made.

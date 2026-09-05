@@ -4,15 +4,16 @@ Slopdex is an experimental derivative of `openai/codex`. It is not an
 official OpenAI release and makes no general production-readiness claim.
 
 - Repository: [SlopSurfer4444/slopdex](https://github.com/SlopSurfer4444/slopdex)
-- Distribution: **SOURCE DROP ONLY**
+- Distribution: **SOURCE + WINDOWS X64 CLI PREVIEW**
 
 The current owner-authorized publication is a full source checkout pinned to
-the recorded upstream base plus the accepted 57-path content. Windows binary
-distribution is explicitly deferred.
+the recorded upstream base plus the accepted 57-path content. A separate
+[Windows release archive](https://github.com/SlopSurfer4444/slopdex/releases/tag/v0.1.0-preview.1)
+contains a privacy-remapped rebuild of the same source.
 
 This directory documents the published source generation, complete patch,
 optional operating-policy references and a narrow live feature receipt.
-Executables and an installer are not included.
+Executables are release assets, not Git source files. No installer is included.
 
 ## Reproduce the source drop
 
@@ -42,6 +43,7 @@ Its product tree and all 57 content hashes match the accepted candidate.
 | `source/PATCH_RECEIPT.md` | Exact-base apply, target-tree, EOL, and isolation proof |
 | `provenance/canonical-content-manifest.txt` | Exact accepted path/content hashes |
 | `provenance/BUILD_RECEIPT.md` | Sanitized build and artifact provenance |
+| `provenance/WINDOWS_RELEASE_R2.md` | Downloadable Windows rebuild, exact hashes and verification scope |
 | `provenance/manifest.current.json` | Machine-readable source, artifact, patch, and claim closure |
 | `dogfood/README.md` | Sanitized narrow live retained-successor receipt |
 | `KNOWN_LIMITATIONS.md` | Genuine unresolved limits and non-claims |
@@ -49,18 +51,22 @@ Its product tree and all 57 content hashes match the accepted candidate.
 | `policy/` | Optional policy profile, skills, and their required references |
 | `PRIVACY_SCAN.md` | Source/text privacy and reference-closure scan |
 
-## Local held artifacts
+## Current Windows archive and historical artifacts
 
-The four executables are retained privately for provenance only and
-are not part of this repository. Their same-generation layout
-and compatibility are recorded in `PORTABLE_WINDOWS.md`. The owner deferred
-binary publication; no runnable download is offered by this source drop.
+Use [PORTABLE_WINDOWS.md](PORTABLE_WINDOWS.md) for the downloadable CLI package.
+Keep all four executables together; no Desktop application or launcher is
+included. Current artifact hashes and bounded checks are in the
+[r2 receipt](provenance/WINDOWS_RELEASE_R2.md).
+
+The original four executable bytes used for the installed-Desktop sample
+remain privately held and are not the downloadable rebuild. Their historical
+record remains in `provenance/BUILD_RECEIPT.md`.
 
 [`SOURCE_SHA256SUMS.txt`](../SOURCE_SHA256SUMS.txt) inventories the published
 source and documentation, excluding the checksum file itself. Historical
 checksums of the private preparation package are not inventories of this repo.
 
-The installed Desktop binding to the held CLI hash was independently verified.
+The installed Desktop binding to the historical held CLI hash was independently verified.
 The live sample proves one exact nested retained-successor flow only; it does
 not prove global exactly-once behavior, crash recovery, arbitrary graph
 reliability, or production readiness.

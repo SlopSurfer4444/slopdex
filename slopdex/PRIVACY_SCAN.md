@@ -1,6 +1,7 @@
 # Privacy and closure scan
 
-Source-drop result: **CLEAR**. Binary distribution: **DEFERRED BY OWNER**.
+Source/text result: **CLEAR**. Current Windows r2 result:
+**DOCUMENTED LOCAL-PATH SCAN PASS**.
 
 ## Source and text payload
 
@@ -39,14 +40,28 @@ limitations, release notes, and sanitized live receipt.
   `819d97ef1dc02bd51aae7d99d88951940584e057`; all 57 target object IDs and
   exact-byte materialized hashes matched.
 
-## Local held binaries
+## Downloadable Windows r2 binaries
+
+The [r2 receipt](provenance/WINDOWS_RELEASE_R2.md) records a distinct, successful
+rebuild using compile-time Rust/native path remapping and basename-only PDB
+references. All four EXEs were scanned as raw ASCII and both UTF-16LE byte
+alignments for the identified private prefixes, structured drive paths and
+CodeView/PDB paths. No targeted private prefix or unexpected drive-path
+candidate was found. Generic Windows runtime paths and a source-code example
+are not build-machine identifiers.
+
+The exact four rebuilt files, not the original held files, are packaged for
+download. The scan proves its stated rules, not the absence of every possible
+secret or identifying string. Raw build logs and local receipts are not assets.
+
+## Historical local held binaries
 
 All four accepted executables contain compiler source-location strings with a
 local user-profile Rust toolchain prefix and a local build-cache Cargo registry
 prefix. The matches are compiler/library/dependency source paths, not embedded
 credentials, account IDs, runtime configuration, user data, or session data.
 
-The owner deferred binary publication, so these files remain local provenance
+The owner deferred publication of that generation, so those files remain local provenance
 artifacts and are outside the current source drop. They were not modified,
 stripped, rebuilt, uploaded, or published.
 

@@ -1,12 +1,18 @@
 {
-  "schema": "slopdex-release-manifest-v3",
+  "schema": "slopdex-release-manifest-v4",
   "publicDestinations": {
     "repository": "https://github.com/SlopSurfer4444/slopdex",
-    "distribution": "SOURCE_DROP_ONLY",
+    "distribution": "SOURCE_AND_WINDOWS_X64_PREVIEW",
     "layout": "full source checkout from the pinned upstream base plus the accepted 57-path content; receipts and policy material are under slopdex/",
     "productSourceCommit": "e497c3d358ae4a3411b0bd16b1ea7e79051e9aa7",
     "productSourceTree": "819d97ef1dc02bd51aae7d99d88951940584e057",
-    "artifactAvailability": "PRIVATELY_HELD_NOT_DISTRIBUTED"
+    "artifactAvailability": "SEPARATE_GITHUB_RELEASE_ASSET",
+    "releaseTag": "v0.1.0-preview.1",
+    "releaseUrl": "https://github.com/SlopSurfer4444/slopdex/releases/tag/v0.1.0-preview.1",
+    "archiveFile": "slopdex-v0.1.0-preview.1-windows-x86_64.zip",
+    "archiveBytes": 141574641,
+    "archiveSha256": "c815339a35857a223b77a78e0366eebfd1e84232c4fd1411e413ee64606b3b62",
+    "artifactFileScope": "paths relative to the archive's top-level folder"
   },
   "source": {
     "repository": "https://github.com/openai/codex",
@@ -22,35 +28,37 @@
   "artifacts": [
     {
       "role": "cli",
-      "file": "artifact/slopdex-windows-x64.exe",
-      "bytes": 298399744,
-      "sha256": "fe0662c5486da33415eb3775630cdc83aa9d5636c05e5c8b14b5c3e86f52a175"
+      "file": "codex.exe",
+      "bytes": 297780736,
+      "sha256": "7727dfc499269496b687a1499ee8b109f65a7da7a90f81106a5276934e4fffed"
     },
     {
       "role": "codeModeHost",
-      "file": "artifact/codex-code-mode-host.exe",
-      "bytes": 73581568,
-      "sha256": "8c1e06c7c164d09c21a7b988908c1fe268ce4840eb32732943d2d062446116b6"
+      "file": "codex-code-mode-host.exe",
+      "bytes": 73126400,
+      "sha256": "707dbbb7ddf3d92ecea941e85a9ee316e77afc9fc5f431a40f5d5f6d864f1850"
     },
     {
       "role": "commandRunner",
-      "file": "artifact/codex-command-runner.exe",
-      "bytes": 8219648,
-      "sha256": "9e7a53cc5657ed0b915c6fbdf4bc74759a902f8e9396ccee990ee2348ceeae95"
+      "file": "codex-command-runner.exe",
+      "bytes": 8081408,
+      "sha256": "6f31a6d9a4fe7ce1a1fdae3b0180daa9d1b6bf9f5877a69f30fd9f9013451563"
     },
     {
       "role": "windowsSandboxSetup",
-      "file": "artifact/codex-windows-sandbox-setup.exe",
-      "bytes": 15521792,
-      "sha256": "510ee34ad331f89505253275645523d68dab5460c746af02a6bf4244efcad09d"
+      "file": "codex-windows-sandbox-setup.exe",
+      "bytes": 15337472,
+      "sha256": "d9cbfe14c1de951b5aa474aeec2b6fdd3f5471c5876aacbd9bfb57bbfd5d701f"
     }
   ],
   "build": {
-    "status": "BUILD_ACCEPTED",
-    "privateReceiptSha256": "12b331bd4bb6dcc103deaefc979c8d6a309a72d6c0dcc7d4b3d9432b204a3b4e",
+    "status": "R2_BUILD_AND_BOUNDED_OFFLINE_CHECKS_ACCEPTED",
+    "privateReceiptSha256": "aba88eeaabb9ab831576446cd049905dc2d8993d2396c020145c5f1a268b76ea",
     "publicReceiptStatus": "SANITIZED_PUBLIC_RECEIPT",
+    "publicReceipt": "provenance/WINDOWS_RELEASE_R2.md",
+    "historicalBuildReceipt": "provenance/BUILD_RECEIPT.md",
     "cliSmoke": "--version => codex-cli 0.0.0; exit 0; bounded non-network smoke",
-    "installedDesktopBinding": "VERIFIED_EXACT_CLI_SHA256"
+    "installedDesktopBinding": "NOT_INSTALLED_BY_THIS_BUILD"
   },
   "sourcePatch": {
     "status": "EXACT_BASE_APPLY_AND_CONTENT_CLOSURE_PASS",
@@ -73,16 +81,18 @@
     "claimCeiling": "configuration limits only; depth is not unlimited and workload safety or backend acceptance is not implied"
   },
   "dogfood": {
-    "status": "LIVE_NESTED_RETAINED_SUCCESSOR_SAMPLE_PASS",
+    "status": "HISTORICAL_LIVE_NESTED_RETAINED_SUCCESSOR_SAMPLE_PASS",
+    "artifactCliSha256": "fe0662c5486da33415eb3775630cdc83aa9d5636c05e5c8b14b5c3e86f52a175",
+    "appliesToCurrentBinaryBytes": false,
     "receipt": "dogfood/README.md",
     "topology": "root -> Astra verifier -> Terra verifier -> Luna checksum",
     "observed": "distinct intermediate Terra PENDING delivery followed by a distinct successor result; no second join and no same exact terminal delivered twice",
     "claimCeiling": "one observed retained-successor sample only; no global exactly-once, crash recovery, arbitrary graph reliability, backend routing, performance, or production-readiness claim"
   },
   "privacy": {
-    "status": "SOURCE_DROP_CLEAR_BINARY_DISTRIBUTION_DEFERRED",
-    "finding": "machine-local compiler source-location paths are embedded in all four accepted executables; no credential or runtime-config material was observed",
+    "status": "SOURCE_TEXT_CLEAR_AND_R2_LOCAL_PATH_SCAN_PASS",
+    "finding": "zero identified private-prefix hits and unexpected structured drive-path candidates in raw ASCII and both UTF16LE alignments of all four r2 EXEs; CodeView PDB references contain basenames only; not a universal secret-free claim",
     "sourceAndTextPayload": "NO_LOCAL_ROOT_OR_CREDENTIAL_FINDING",
-    "binaryDecision": "held locally; owner deferred binary publication"
+    "binaryDecision": "r2 four-EXE generation packaged for separate Windows preview release; original installed artifact remains privately held"
   }
 }

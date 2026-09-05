@@ -28,8 +28,12 @@ not every entry has a publishable reproducer yet.
   preserves those exact bytes in Git blobs, but a checkout with automatic EOL
   conversion may materialize different working-tree byte hashes. See
   `source/PATCH_RECEIPT.md`.
-- No benchmarked speedup, cost saving, broad compatibility, resource claim,
-  installer behavior, or binary distribution is claimed by this source drop.
+- The downloadable Windows r2 archive rebuilds the same accepted source with
+  path-remapping controls. Its exact-byte evidence is build, offline launch
+  and local-path scanning, not a new installed-Desktop or live-model run.
+  The earlier live nested receipt belongs to the historical binary generation.
+- No benchmarked speedup, cost saving, broad compatibility, resource claim
+  or installer behavior is claimed. No macOS binary is included.
 
 Run only in a disposable isolated environment. Do not copy authentication,
 session, configuration, or machine-identifying data into reports or assets.

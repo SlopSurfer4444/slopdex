@@ -6,11 +6,13 @@ Slopdex is a power-user Codex source preview for recursive agent work: keep the
 architecture in one conversation, split useful independent work into temporary
 trees, and bring results back to the agents responsible for them.
 
-**This is the first source drop.** The modified Rust source and tests are in
-this repository, alongside the portable patch, verification notes and optional
-orchestration skills. A Windows build has been tested locally; downloadable
-binaries will be published separately. Nothing here replaces your installed
-Codex automatically.
+**Source and a Windows x64 CLI preview are available.** The modified Rust
+source and tests are in this repository, alongside the portable patch,
+verification notes and optional orchestration skills. Nothing here replaces
+your installed Codex automatically.
+
+[Download Slopdex v0.1.0-preview.1 for Windows x64](https://github.com/SlopSurfer4444/slopdex/releases/tag/v0.1.0-preview.1)
+and follow the [portable CLI instructions](slopdex/PORTABLE_WINDOWS.md).
 
 This is an independent derivative of [OpenAI Codex](https://github.com/openai/codex),
 not an official OpenAI release or an OpenAI-endorsed project.
@@ -52,6 +54,9 @@ are not automatically a duplicate delivery. See the receipt for the exact
 claim and exclusions. Restart/crash exactly-once replay is not claimed.
 
 ## Build the source
+
+Prefer the ready-made Windows archive? See the download above. Building from
+source remains available for reviewing and modifying the patch.
 
 The baseline is upstream commit
 [`612e6491d50ffb80ffc4330edc4024b86e51e4bf`](https://github.com/openai/codex/commit/612e6491d50ffb80ffc4330edc4024b86e51e4bf).
@@ -114,6 +119,11 @@ GPT-5.6 Sol led this campaign, with Terra and Luna contributing. The accepted
 source, tests, source review and locally built artifact were frozen before
 the parent conversation switched to Astra. Astra participated in final
 installed-runtime checks and publication preparation.
+
+The downloadable Windows archive is a later privacy-remapped rebuild of that
+same source, coordinated on Astra. Its own checks cover build, bounded offline
+launch and local-path scanning; the earlier live nested sample belongs to the
+original artifact, not this rebuild.
 
 Now we will test how much this approach helps with Astra: completion time,
 cost, repeated work and the amount of owner intervention. We may simplify
