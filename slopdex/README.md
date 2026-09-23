@@ -12,7 +12,7 @@ the recorded upstream base plus the accepted 57-path content. A separate
 contains a privacy-remapped rebuild of the same source.
 
 This directory documents the published source generation, complete patch,
-optional operating-policy references and a narrow live feature receipt.
+historical orchestration notes and a narrow live feature receipt.
 Executables are release assets, not Git source files. No installer is included.
 
 ## Reproduce the source drop
@@ -48,7 +48,7 @@ Its product tree and all 57 content hashes match the accepted candidate.
 | `dogfood/README.md` | Sanitized narrow live retained-successor receipt |
 | `KNOWN_LIMITATIONS.md` | Genuine unresolved limits and non-claims |
 | `LICENSE`, `NOTICE`, `ATTRIBUTION.md` | Upstream and derivative attribution |
-| `policy/` | Optional policy profile, skills, and their required references |
+| `policy/` | Historical orchestration notes; no installable skill bundle |
 | `PRIVACY_SCAN.md` | Source/text privacy and reference-closure scan |
 
 ## Current Windows archive and historical artifacts

@@ -2,13 +2,15 @@
 
 **One thread. A whole workshop behind it.**
 
+**Status:** Development is paused at the published preview. Further time and AI-agent budget are directed toward applied projects. Source, test records and the experimental Windows CLI remain available; see [known limitations](slopdex/KNOWN_LIMITATIONS.md) before evaluating the preview.
+
 Slopdex is a power-user Codex source preview for recursive agent work: keep the
 architecture in one conversation, split useful independent work into temporary
 trees, and bring results back to the agents responsible for them.
 
 **Source and a Windows x64 CLI preview are available.** The modified Rust
 source and tests are in this repository, alongside the portable patch,
-verification notes and optional orchestration skills. Nothing here replaces
+verification notes. Nothing here replaces
 your installed Codex automatically.
 
 [Download Slopdex v0.1.0-preview.1 for Windows x64](https://github.com/SlopSurfer4444/slopdex/releases/tag/v0.1.0-preview.1)
@@ -26,7 +28,6 @@ not an official OpenAI release or an OpenAI-endorsed project.
 - [Known limitations and findings not claimed as fixed](slopdex/KNOWN_LIMITATIONS.md)
 - [Source and build provenance](slopdex/provenance/)
 - [Observed live nested completion](slopdex/dogfood/)
-- [Optional skills and global instruction sample](slopdex/policy/)
 - [Portable patch against the pinned upstream](slopdex/source/)
 - [The original public discussion, #40037](https://github.com/openai/codex/issues/40037)
 
@@ -83,61 +84,21 @@ checkout of the pinned upstream instead. Its receipt documents line endings,
 the complete path set and the application check. Bit-for-bit reproducible
 executables across machines are not claimed.
 
-## The optional operating stack
+## Native waiting beyond the current turn
 
-The runtime and the instructions solve different parts of the problem. The
-skills teach the working pattern: maintain a campaign dependency graph,
-launch ready independent branches, choose models with enough capability,
-and aggregate through the nearest responsible agent. They do not require a
-fixed number of agents or a permanent coordinator for every task.
+The parent can register an owned join for a specific child turn and finish its current turn while the child continues working. Completion is delivered through the native session queue, allowing the parent to resume and aggregate the result without a polling loop.
 
-The [current optional recipe](slopdex/policy/README.md) combines three skills:
+The patch preserves the relevant parent-child binding across the covered successor continuation. It also handles delayed completion signals, suppresses duplicate delivery for the same result identity, and gives user input priority. These lifecycle changes are separate from increasing agent capacity or recursion depth.
 
-- [Aggressive recursive orchestration](slopdex/policy/skills/aggressive-recursive-orchestration/SKILL.md): find useful independent branches and choose models deliberately.
-- [Adaptive orchestration](slopdex/policy/skills/adaptive-orchestration/SKILL.md): own results, wait natively, verify evidence and iterate safely.
-- [Campaign DAG orchestration](slopdex/policy/skills/campaign-dag-orchestration/SKILL.md): keep one dependency plan and launch ready waves toward a shared checkpoint.
+In the recorded Windows sample, a leaf completed, its coordinator resumed automatically, and the parent received a distinct intermediate result followed by the coordinator's later result without registering a second join. See the [live sample](slopdex/dogfood/README.md) and [implementation and regression map](slopdex/REVIEW_GUIDE.md). The sample is scoped evidence, not a general crash/restart delivery guarantee.
 
-The [global instruction sample](slopdex/policy/global-AGENTS.sample.md) connects
-them. Follow the recipe's installation steps and review the files before
-adopting them; you can use Slopdex without this stack.
+## Development history
 
-**Post-drop decision, 2026-09-05:** in the first Astra field campaigns we chose
-to retire the separate role-initialization layer from the active recipe. Give
-the project an ordinary task; a separate coordinator is useful when the work
-justifies one, not because the user remembered a title or skill name. Scope,
-ownership, verification and real approval boundaries still apply. See
-[the policy-evolution note](slopdex/policy/EVOLUTION.md). The earlier Sol
-configuration remains in Git history; the public English narrative preserves
-that chapter. Nothing in this repository changes your global settings automatically.
+GPT-5.6 Sol led the original campaign, with Terra and Luna contributing. The source, tests and review checkpoint were frozen before the coordinating conversation switched to Astra. Astra participated in installed-runtime checks and publication preparation.
 
-Independent writers are useful only when their write surfaces and dependencies
-really are separate.
+The downloadable Windows archive is a later privacy-remapped rebuild of the same source, coordinated on Astra. Its checks cover build, bounded offline launch and local-path scanning; the earlier live nested sample belongs to the original artifact. The published observations are field evidence, not a controlled token-economics benchmark.
 
-## Built with Sol. Next: Astra.
-
-GPT-5.6 Sol led this campaign, with Terra and Luna contributing. The accepted
-source, tests, source review and locally built artifact were frozen before
-the parent conversation switched to Astra. Astra participated in final
-installed-runtime checks and publication preparation.
-
-The downloadable Windows archive is a later privacy-remapped rebuild of that
-same source, coordinated on Astra. Its own checks cover build, bounded offline
-launch and local-path scanning; the earlier live nested sample belongs to the
-original artifact, not this rebuild.
-
-Now we will test how much this approach helps with Astra: completion time,
-cost, repeated work and the amount of owner intervention. We may simplify
-the skills or retire patches as upstream covers their behavior. The current
-observations are field evidence, not a controlled token-economics benchmark.
-
-**On Sol: just try it. On Astra: let's find out.** Early mechanics checks do
-not yet establish the stack's overall usefulness or economics on Astra.
-
-Give it a real task. Tell us where the graph helps, where it wastes effort,
-and where it fails. A reproducible counterexample is welcome.
-
-> I did not leave Codex for another orchestrator. I liked Codex enough that,
-> when its limits got in the way of my work, I started moving the limits myself.
+The experiment is retained as a source and CLI preview. Further development is paused so that time and AI-agent budget can go to applied projects. Earlier plans and campaign details remain in the project notes and Git history.
 
 ## Attribution and license
 

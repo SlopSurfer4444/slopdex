@@ -1,3 +1,5 @@
+Historical campaign narrative. Development is paused; the optional skills and global instruction sample are no longer bundled.
+
 # Slopdex — the first source drop after Arc III
 
 This is a continuation of [#40037](https://github.com/openai/codex/issues/40037), not a fourth retelling of the same architecture hypothesis.
@@ -92,7 +94,7 @@ Luna remains useful as a low-cost leaf route. This preview does not claim that L
 The frozen source checkpoint was detached HEAD `612e6491d50ffb80ffc4330edc4024b86e51e4bf`, tree `568d39f181926f57c73dd34c2fceb419bab1979e`, with an accepted 57-path patchset (37 tracked plus 20 untracked). That pinned upstream plus the patchset is now published on Slopdex `main`. The exact owner test group passed 82/82 and independent source review was CLEAR.
 
 - Source and README: [Slopdex](https://github.com/SlopSurfer4444/slopdex)
-- Operating policy, skills, and compact global `AGENTS.md`: [`slopdex/policy/`](https://github.com/SlopSurfer4444/slopdex/tree/main/slopdex/policy)
+- Historical orchestration notes (the installable bundle has been removed): [`slopdex/policy/`](https://github.com/SlopSurfer4444/slopdex/tree/main/slopdex/policy)
 - Source provenance and limitations: [`slopdex/provenance/`](https://github.com/SlopSurfer4444/slopdex/tree/main/slopdex/provenance)
 - Dogfood evidence: [`slopdex/dogfood/`](https://github.com/SlopSurfer4444/slopdex/tree/main/slopdex/dogfood)
 
